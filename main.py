@@ -184,12 +184,34 @@ class SendIn(BaseModel): candidate_ids:list[str]; kind:str; template_name:str=''
 
 @app.on_event('startup')
 def startup():
-    c=db(); n=c.execute('SELECT COUNT(*) n FROM users').fetchone()['n']
-    if n==0:
-        username=os.getenv('ADMIN_USERNAME','admin'); password=os.getenv('ADMIN_PASSWORD','')
-        if not password: password=secrets.token_urlsafe(14); print('INITIAL ADMIN PASSWORD (set ADMIN_PASSWORD in Render):',password)
-        c.execute('INSERT INTO users(username,password_hash,role) VALUES(?,?,?)',(username,phash(password),'admin')); c.commit()
-    c.close()
+    # ADMIN_USERNAME / ADMIN_PASSWORD are the authoritative bootstrap credentials.
+    # Existing HR users, templates, settings, logs and chats are never deleted.
+    c=db()
+    try:
+        username=(os.getenv('ADMIN_USERNAME') or 'admin').strip()
+        password=os.getenv('ADMIN_PASSWORD') or ''
+        admin_row=c.execute("SELECT id,username FROM users WHERE role='admin' ORDER BY id ASC LIMIT 1").fetchone()
+        if not admin_row:
+            # Create the first admin only when no admin account exists.
+            if not password:
+                password=secrets.token_urlsafe(18)
+                print('INITIAL ADMIN PASSWORD was generated. Set ADMIN_PASSWORD in Render Environment.')
+            c.execute("INSERT INTO users(username,password_hash,role,active) VALUES(?,?,'admin',1)",(username,phash(password)))
+            c.commit()
+        elif password:
+            # Fixes the common case where the database was initialized before
+            # ADMIN_PASSWORD was added to Render. Update only the admin login row.
+            # If the requested username belongs to an HR account, do not overwrite it.
+            name_owner=c.execute('SELECT id,role FROM users WHERE username=?',(username,)).fetchone()
+            if name_owner and name_owner['id'] != admin_row['id']:
+                print('ADMIN CREDENTIAL SYNC skipped: ADMIN_USERNAME is already used by another account.')
+            else:
+                c.execute('UPDATE users SET username=?, password_hash=?, active=1 WHERE id=?',
+                          (username,phash(password),admin_row['id']))
+                c.commit()
+                print('Admin login credentials synchronized from Render Environment Variables.')
+    finally:
+        c.close()
 
 @app.get('/')
 def home(): return FileResponse(BASE/'static'/'index.html')

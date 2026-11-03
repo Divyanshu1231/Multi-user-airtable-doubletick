@@ -1,4 +1,4 @@
-import os, re, json, hmac, hashlib, secrets, sqlite3, time, requests, threading, copy
+import os, re, json, hmac, hashlib, secrets, sqlite3, time, requests, threading, copy, uuid
 from pathlib import Path
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
@@ -63,7 +63,9 @@ def db():
         existing={r['name'] for r in c.execute("SELECT column_name AS name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='templates'").fetchall()}
         for col,ddl in {'language':"TEXT DEFAULT 'en'",'category':"TEXT DEFAULT 'MARKETING'",'approval_status':"TEXT DEFAULT 'DRAFT'",'header_text':"TEXT DEFAULT ''",'footer_text':"TEXT DEFAULT ''",'provider_detail':"TEXT DEFAULT ''",'submitted_at':"TEXT DEFAULT ''"}.items():
             if col not in existing: c.execute(f'ALTER TABLE templates ADD COLUMN {col} {ddl}')
-        c.execute("CREATE TABLE IF NOT EXISTS chat_messages(id BIGSERIAL PRIMARY KEY, user_id BIGINT, phone TEXT NOT NULL, candidate_name TEXT DEFAULT '', direction TEXT NOT NULL, message_type TEXT DEFAULT 'TEXT', content TEXT DEFAULT '', media_url TEXT DEFAULT '', provider_message_id TEXT DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        c.execute("CREATE TABLE IF NOT EXISTS chat_messages(id BIGSERIAL PRIMARY KEY, user_id BIGINT, phone TEXT NOT NULL, candidate_name TEXT DEFAULT '', direction TEXT NOT NULL, message_type TEXT DEFAULT 'TEXT', content TEXT DEFAULT '', media_url TEXT DEFAULT '', provider_message_id TEXT DEFAULT '', status TEXT DEFAULT 'RECEIVED', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        chat_cols={r['name'] for r in c.execute("SELECT column_name AS name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='chat_messages'").fetchall()}
+        if 'status' not in chat_cols: c.execute("ALTER TABLE chat_messages ADD COLUMN status TEXT DEFAULT 'RECEIVED'")
         c.execute("CREATE TABLE IF NOT EXISTS logs(id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, candidate_name TEXT, phone TEXT, kind TEXT, template_name TEXT, status TEXT, detail TEXT, provider_message_id TEXT DEFAULT '', status_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         log_cols={r['name'] for r in c.execute("SELECT column_name AS name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='logs'").fetchall()}
         for col,ddl in {'provider_message_id':"TEXT DEFAULT ''",'status_updated_at':"TIMESTAMP DEFAULT CURRENT_TIMESTAMP"}.items():
@@ -76,7 +78,9 @@ def db():
     existing={r['name'] for r in c.execute('PRAGMA table_info(templates)').fetchall()}
     for col,ddl in {'language':"TEXT DEFAULT 'en'",'category':"TEXT DEFAULT 'MARKETING'",'approval_status':"TEXT DEFAULT 'DRAFT'",'header_text':"TEXT DEFAULT ''",'footer_text':"TEXT DEFAULT ''",'provider_detail':"TEXT DEFAULT ''",'submitted_at':"TEXT DEFAULT ''"}.items():
         if col not in existing: c.execute(f'ALTER TABLE templates ADD COLUMN {col} {ddl}')
-    c.execute("CREATE TABLE IF NOT EXISTS chat_messages(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, phone TEXT NOT NULL, candidate_name TEXT DEFAULT '', direction TEXT NOT NULL, message_type TEXT DEFAULT 'TEXT', content TEXT DEFAULT '', media_url TEXT DEFAULT '', provider_message_id TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+    c.execute("CREATE TABLE IF NOT EXISTS chat_messages(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, phone TEXT NOT NULL, candidate_name TEXT DEFAULT '', direction TEXT NOT NULL, message_type TEXT DEFAULT 'TEXT', content TEXT DEFAULT '', media_url TEXT DEFAULT '', provider_message_id TEXT DEFAULT '', status TEXT DEFAULT 'RECEIVED', created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+    chat_cols={r['name'] for r in c.execute('PRAGMA table_info(chat_messages)').fetchall()}
+    if 'status' not in chat_cols: c.execute("ALTER TABLE chat_messages ADD COLUMN status TEXT DEFAULT 'RECEIVED'")
     c.execute("CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, candidate_name TEXT, phone TEXT, kind TEXT, template_name TEXT, status TEXT, detail TEXT, provider_message_id TEXT DEFAULT '', status_updated_at TEXT DEFAULT CURRENT_TIMESTAMP, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
     existing_logs={r['name'] for r in c.execute('PRAGMA table_info(logs)').fetchall()}
     for col,ddl in {'provider_message_id':"TEXT DEFAULT ''",'status_updated_at':"TEXT DEFAULT CURRENT_TIMESTAMP"}.items():
@@ -181,6 +185,7 @@ class TemplateIn(BaseModel):
     name:str; kind:str='custom'; content:str; template_name:str=''
     language:str='en'; category:str='MARKETING'; header_text:str=''; footer_text:str=''
 class SendIn(BaseModel): candidate_ids:list[str]; kind:str; template_name:str=''; message:str=''; language:str='en'
+class ChatReplyIn(BaseModel): message:str=Field(min_length=1,max_length=4000)
 
 @app.on_event('startup')
 def startup():
@@ -453,29 +458,42 @@ async def doubletick_webhook(request:Request, x_webhook_secret:Optional[str]=Hea
     try: payload=await request.json()
     except Exception: raise HTTPException(400,'Webhook body must be valid JSON')
     if not isinstance(payload,dict): raise HTTPException(400,'Webhook payload must be a JSON object')
-    event=str(payload.get('event') or payload.get('eventType') or '').upper()
+    event=str(payload.get('event') or payload.get('eventType') or payload.get('type') or '').upper()
+    # DoubleTick's documented sample body omits an explicit event field;
+    # infer the event from its distinctive payload shape when necessary.
+    if not event and isinstance(payload.get('message'),dict) and payload.get('from') and payload.get('to'):
+        event='MESSAGE_RECEIVED'
+    if not event and payload.get('status') and payload.get('to'):
+        event='MESSAGE_STATUS_UPDATE'
     if event == 'MESSAGE_RECEIVED':
-        msg=payload.get('message') if isinstance(payload.get('message'),dict) else {}
-        phone=re.sub(r'\D','',str(payload.get('from') or payload.get('customerPhone') or ''))
+        data=payload.get('data') if isinstance(payload.get('data'),dict) else payload.get('payload') if isinstance(payload.get('payload'),dict) else payload
+        msg=data.get('message') if isinstance(data.get('message'),dict) else {}
+        phone=re.sub(r'\D','',str(data.get('from') or data.get('customerPhone') or data.get('sender') or ''))
         if not phone: raise HTTPException(400,'Incoming message is missing sender phone number')
-        contact=payload.get('contact') if isinstance(payload.get('contact'),dict) else {}
-        name=str(contact.get('name') or payload.get('customerName') or phone)[:200]
-        mtype=str(msg.get('type') or 'TEXT').upper()
-        text_value=msg.get('text') or msg.get('caption') or msg.get('body') or ''
-        if isinstance(text_value,dict): text_value=json.dumps(text_value,ensure_ascii=False)
-        media_url=str(msg.get('url') or msg.get('mediaUrl') or '')
+        contact=data.get('contact') if isinstance(data.get('contact'),dict) else {}
+        name=str(contact.get('name') or data.get('customerName') or data.get('name') or phone)[:200]
+        mtype=str(msg.get('type') or data.get('messageType') or 'TEXT').upper()
+        text_value=msg.get('text') or msg.get('caption') or msg.get('body') or msg.get('title') or ''
+        if isinstance(text_value,(dict,list)): text_value=json.dumps(text_value,ensure_ascii=False)
+        media_url=str(msg.get('url') or msg.get('mediaUrl') or msg.get('media_url') or '')
         if not text_value and media_url: text_value=f'[{mtype}]'
-        message_id=str(payload.get('messageId') or payload.get('dtMessageId') or '')
+        if not text_value: text_value=json.dumps(msg or data,ensure_ascii=False)[:4000]
+        message_id=str(data.get('dtMessageId') or data.get('messageId') or '')
         c=db()
-        owner=c.execute("SELECT user_id,candidate_name FROM logs WHERE REPLACE(REPLACE(REPLACE(phone,'+',''),' ',''),'-','') LIKE ? ORDER BY id DESC LIMIT 1",('%'+phone[-10:],)).fetchone()
+        if DATABASE_URL:
+            owner=c.execute("SELECT user_id,candidate_name,phone FROM logs WHERE RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? ORDER BY id DESC LIMIT 1",(phone[-10:],)).fetchone()
+        else:
+            owner=c.execute("SELECT user_id,candidate_name,phone FROM logs WHERE substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? ORDER BY id DESC LIMIT 1",(phone[-10:],)).fetchone()
         uid=owner['user_id'] if owner else None
+        canonical=re.sub(r'\D','',str(owner['phone'] or '')) if owner and owner['phone'] else phone
         if owner and owner['candidate_name']: name=str(owner['candidate_name'])
         duplicate=None
         if message_id: duplicate=c.execute("SELECT id FROM chat_messages WHERE provider_message_id=? AND provider_message_id<>'' LIMIT 1",(message_id,)).fetchone()
         if not duplicate:
-            c.execute('INSERT INTO chat_messages(user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id) VALUES(?,?,?,?,?,?,?,?)',(uid,phone,name,'IN',mtype,str(text_value)[:5000],media_url,message_id))
+            c.execute('INSERT INTO chat_messages(user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id,status) VALUES(?,?,?,?,?,?,?,?,?)',
+                      (uid,canonical,name,'IN',mtype,str(text_value)[:5000],media_url,message_id,'RECEIVED'))
         c.commit(); c.close()
-        return {'ok':True,'event':'MESSAGE_RECEIVED','saved':not bool(duplicate),'assigned':bool(uid)}
+        return {'ok':True,'event':'MESSAGE_RECEIVED','saved':not bool(duplicate),'assigned':bool(uid),'matched_phone':bool(owner)}
 
     # Template status notifications use TEMPLATE_STATUS_UPDATE as the payload event name.
     if event in ('TEMPLATE_UPDATE','TEMPLATE_STATUS_UPDATE') or payload.get('newStatus'):
@@ -509,6 +527,7 @@ async def doubletick_webhook(request:Request, x_webhook_secret:Optional[str]=Hea
                     target=candidate; break
         if target:
             c.execute('UPDATE logs SET status=?,detail=?,status_updated_at=CURRENT_TIMESTAMP WHERE id=?', (status,detail,target['id']))
+        if message_id: c.execute('UPDATE chat_messages SET status=? WHERE provider_message_id=?',(status,message_id))
         c.commit(); c.close()
         return {'ok':True,'event':'MESSAGE_STATUS_UPDATE','matched':bool(target),'status':status,'message_id':message_id}
     return {'ok':True,'ignored':True,'event':event}
@@ -581,6 +600,56 @@ def send(x:SendIn,u=Depends(current_user)):
         results.append({'name':str(f.get('name') or ''),'status':current_status if current_status in final_states else status,'detail':detail,'message_id':provider_id})
     c.close()
     return {'ok':True,'summary':{'total':len(results),'sent':sum(z['status'] in ('SENT','DELIVERED','READ','ENQUEUED') for z in results),'failed':sum(z['status']=='FAILED' for z in results),'enqueued':sum(z['status']=='ENQUEUED' for z in results)},'results':results}
+def _e164(value):
+    digits=re.sub(r'\D','',str(value or ''))
+    if len(digits)==10: digits='91'+digits
+    return '+'+digits if 10<=len(digits)<=15 else ''
+
+@app.post('/api/chats/{phone}/reply')
+def send_chat_reply(phone:str, x:ChatReplyIn, u=Depends(current_user)):
+    """Send a free-form WhatsApp reply through DoubleTick (24-hour session only)."""
+    digits=re.sub(r'\D','',phone)
+    if not digits: raise HTTPException(400,'Invalid phone number')
+    api_key=os.getenv('DOUBLETICK_API_KEY','').strip()
+    sender=_e164(os.getenv('DOUBLETICK_SENDER_NUMBER') or os.getenv('DOUBLETICK_WABA_NUMBER') or '')
+    recipient=_e164(digits)
+    if not api_key: raise HTTPException(503,'DOUBLETICK_API_KEY is not configured on the server.')
+    if not sender: raise HTTPException(503,'Set DOUBLETICK_SENDER_NUMBER (your WhatsApp sender number) in Render.')
+    if not recipient: raise HTTPException(400,'Candidate phone number must be a valid international number.')
+    c=db()
+    if u['role']!='admin':
+        if DATABASE_URL:
+            allowed=c.execute("SELECT 1 FROM logs WHERE user_id=? AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? LIMIT 1",(u['id'],digits[-10:])).fetchone()
+        else:
+            allowed=c.execute("SELECT 1 FROM logs WHERE user_id=? AND substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? LIMIT 1",(u['id'],digits[-10:])).fetchone()
+        if not allowed:
+            c.close(); raise HTTPException(403,'This conversation is not assigned to your HR account.')
+    msg_id=str(uuid.uuid4())
+    payload={'to':recipient,'from':sender,'messageId':msg_id,'content':{'text':x.message.strip()}}
+    try:
+        resp=requests.post('https://public.doubletick.io/whatsapp/message/text',
+                           headers={'Authorization':api_key,'Content-Type':'application/json','Accept':'application/json'},
+                           json=payload,timeout=30)
+        try: body=resp.json()
+        except Exception: body={'raw':resp.text[:1500]}
+    except requests.RequestException as exc:
+        c.close(); raise HTTPException(502,f'DoubleTick connection failed: {exc}')
+    if resp.status_code not in (200,201,202):
+        c.close()
+        detail=body.get('message') or body.get('error') or body
+        raise HTTPException(resp.status_code if 400<=resp.status_code<500 else 502,
+            f'DoubleTick rejected reply. Free-form replies require an active 24-hour customer service window. Provider response: {detail}')
+    provider_id=_find_provider_message_id(body) or msg_id
+    if DATABASE_URL:
+        name_row=c.execute("SELECT candidate_name FROM logs WHERE RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? ORDER BY id DESC LIMIT 1",(digits[-10:],)).fetchone()
+    else:
+        name_row=c.execute("SELECT candidate_name FROM logs WHERE substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? ORDER BY id DESC LIMIT 1",(digits[-10:],)).fetchone()
+    candidate_name=name_row['candidate_name'] if name_row else ''
+    c.execute("INSERT INTO chat_messages(user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id,status) VALUES(?,?,?,?,?,?,?,?,?)",
+              (u['id'],digits,candidate_name,'OUT','TEXT',x.message.strip(),'',provider_id,'SENT'))
+    c.commit(); c.close()
+    return {'ok':True,'status':'SENT','message_id':provider_id,'provider':body}
+
 @app.get('/api/chats')
 def chats(u=Depends(current_user)):
     c=db()
@@ -602,10 +671,10 @@ def chat_detail(phone:str,u=Depends(current_user)):
     if not digits: raise HTTPException(400,'Invalid phone number')
     c=db()
     if u['role']=='admin':
-        incoming=c.execute('SELECT id,user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id,created_at FROM chat_messages WHERE phone=? ORDER BY id ASC LIMIT 1000',(digits,)).fetchall()
+        incoming=c.execute('SELECT id,user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id,status,created_at FROM chat_messages WHERE phone=? ORDER BY id ASC LIMIT 1000',(digits,)).fetchall()
         outgoing=c.execute("SELECT id,user_id,phone,candidate_name,'OUT' direction,kind message_type,template_name content,'' media_url,provider_message_id,created_at,status FROM logs WHERE REPLACE(REPLACE(REPLACE(phone,'+',''),' ',''),'-','') LIKE ? ORDER BY id ASC LIMIT 1000",('%'+digits[-10:],)).fetchall()
     else:
-        incoming=c.execute('SELECT id,user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id,created_at FROM chat_messages WHERE phone=? AND user_id=? ORDER BY id ASC LIMIT 1000',(digits,u['id'])).fetchall()
+        incoming=c.execute('SELECT id,user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id,status,created_at FROM chat_messages WHERE phone=? AND user_id=? ORDER BY id ASC LIMIT 1000',(digits,u['id'])).fetchall()
         outgoing=c.execute("SELECT id,user_id,phone,candidate_name,'OUT' direction,kind message_type,template_name content,'' media_url,provider_message_id,created_at,status FROM logs WHERE user_id=? AND REPLACE(REPLACE(REPLACE(phone,'+',''),' ',''),'-','') LIKE ? ORDER BY id ASC LIMIT 1000",(u['id'],'%'+digits[-10:])).fetchall()
     items=[dict(x) for x in incoming]+[dict(x) for x in outgoing]
     items.sort(key=lambda x:str(x.get('created_at') or ''))

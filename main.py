@@ -449,11 +449,17 @@ def _find_provider_status(value):
 
 @app.post('/api/webhooks/doubletick')
 async def doubletick_webhook(request:Request, x_webhook_secret:Optional[str]=Header(None)):
-    """Receive DoubleTick TEMPLATE_UPDATE and MESSAGE_STATUS_UPDATE events."""
+    """Receive DoubleTick events.
+
+    Supports either the X-Webhook-Secret header (when the provider supports
+    custom headers) or a URL query token (?token=...) for webhook dashboards
+    that only expose a URL field.
+    """
     expected=os.getenv('DOUBLETICK_WEBHOOK_SECRET','').strip()
     if not expected:
         raise HTTPException(503,'DOUBLETICK_WEBHOOK_SECRET is not configured.')
-    if not x_webhook_secret or not hmac.compare_digest(x_webhook_secret,expected):
+    supplied=(x_webhook_secret or request.query_params.get('token') or request.query_params.get('secret') or '').strip()
+    if not supplied or not hmac.compare_digest(supplied,expected):
         raise HTTPException(401,'Invalid webhook secret')
     try: payload=await request.json()
     except Exception: raise HTTPException(400,'Webhook body must be valid JSON')

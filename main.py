@@ -183,7 +183,7 @@ class TemplateIn(BaseModel):
     language:str='en'; category:str='MARKETING'; header_text:str=''; footer_text:str=''
 class SendIn(BaseModel): candidate_ids:list[str]; kind:str; template_name:str=''; message:str=''; language:str='en'
 class CsvPreviewIn(BaseModel): upload_id:str
-class CsvSendIn(BaseModel): upload_id:str; candidate_ids:list[str]; template_name:str; language:str='en'
+class CsvSendIn(BaseModel): upload_id:str; candidate_ids:list[str]; template_name:str; language:str='en'; confirm_opt_in:bool=False
 
 @app.on_event('startup')
 def startup():
@@ -325,9 +325,8 @@ def _csv_candidate(row):
     spec=_csv_field(row,['Specialization','Specialisation','Specialty','Speciality','Department'])
     state=_csv_field(row,['State','Location State','Candidate State','Preferred State'])
     city=_csv_field(row,['City','Location City','Preferred City'])
-    consent=_csv_field(row,['WhatsApp Opt-In','WhatsApp Opt In','Opt In','Consent','WhatsApp Consent'])
-    yes=str(consent).strip().lower() in ('yes','true','1','checked','opted in','opt-in')
-    return {'name':str(name or '').strip(),'phone':phone(mobile),'specialization':str(spec or '').strip(),'state':str(state or '').strip(),'city':str(city or '').strip(),'opt_in':yes,'_raw':row}
+    # Consent is confirmed by the sender at campaign time; it is not inferred from a CSV column.
+    return {'name':str(name or '').strip(),'phone':phone(mobile),'specialization':str(spec or '').strip(),'state':str(state or '').strip(),'city':str(city or '').strip(),'opt_in':False,'_raw':row}
 
 @app.post('/api/csv/upload')
 async def upload_candidate_csv(file: UploadFile=File(...), u=Depends(current_user)):
@@ -348,7 +347,7 @@ async def upload_candidate_csv(file: UploadFile=File(...), u=Depends(current_use
         for key in list(_csv_uploads):
             if time.time()-_csv_uploads[key]['created']>1800: _csv_uploads.pop(key,None)
     preview=[_csv_candidate(r) for r in rows[:8]]
-    return {'upload_id':upload_id,'headers':headers,'total_rows':len(rows),'preview':[{'name':x['name'],'phone_present':bool(x['phone']),'specialization':x['specialization'],'state':x['state'],'city':x['city'],'opt_in':x['opt_in']} for x in preview]}
+    return {'upload_id':upload_id,'headers':headers,'total_rows':len(rows),'preview':[{'name':x['name'],'phone_present':bool(x['phone']),'specialization':x['specialization'],'state':x['state'],'city':x['city'],'opt_in':False} for x in preview]}
 
 @app.post('/api/csv/preview')
 def preview_candidate_csv(x:CsvPreviewIn,u=Depends(current_user)):
@@ -360,7 +359,7 @@ def preview_candidate_csv(x:CsvPreviewIn,u=Depends(current_user)):
         digits=re.sub(r'\D','',cand['phone'])
         duplicate=digits in seen if digits else False
         if digits: seen.add(digits)
-        result.append({'id':str(i),'name':cand['name'] or 'Unnamed candidate','specialization':cand['specialization'],'state':cand['state'],'city':cand['city'],'phone_valid':len(digits)>=12,'opt_in':cand['opt_in'],'duplicate':duplicate,'sendable':bool(cand['phone']) and len(digits)>=12 and cand['opt_in'] and not duplicate})
+        result.append({'id':str(i),'name':cand['name'] or 'Unnamed candidate','phone_display':cand['phone'],'specialization':cand['specialization'],'state':cand['state'],'city':cand['city'],'phone_valid':len(digits)>=12,'opt_in':False,'duplicate':duplicate,'sendable':bool(cand['phone']) and len(digits)>=12 and not duplicate})
     item['candidates']=candidates
     return {'total':len(result),'sendable':sum(1 for x in result if x['sendable']),'candidates':result}
 
@@ -369,6 +368,7 @@ def send_candidate_csv(x:CsvSendIn,u=Depends(current_user)):
     item=_csv_uploads.get(x.upload_id)
     if not item or item['user_id']!=u['id']: raise HTTPException(404,'CSV upload expired. Please upload it again.')
     if not x.candidate_ids: raise HTTPException(400,'Select at least one eligible CSV candidate.')
+    if not x.confirm_opt_in: raise HTTPException(400,'Confirm that every selected contact has explicitly opted in to receive WhatsApp messages.')
     if not x.template_name.strip(): raise HTTPException(400,'Approved DoubleTick template name is required.')
     from matcher import send_doubletick_candidate_message
     rows=item.get('candidates') or [_csv_candidate(r) for r in item['rows']]
@@ -376,7 +376,6 @@ def send_candidate_csv(x:CsvSendIn,u=Depends(current_user)):
     for i,cand in enumerate(rows):
         digits=re.sub(r'\D','',cand['phone'])
         if str(i) in wanted:
-            if not cand['opt_in']: raise HTTPException(400,'WhatsApp consent is required. Only candidates with an explicit opt-in value can be messaged.')
             if not cand['phone'] or len(digits)<12: raise HTTPException(400,'Selected CSV contains an invalid phone number.')
             chosen.append((i,cand))
     if len(chosen)!=len(wanted): raise HTTPException(400,'Some selected CSV rows are invalid. Preview the CSV again.')

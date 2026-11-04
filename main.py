@@ -679,59 +679,103 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
         logger.info("DoubleTick webhook acknowledged non-object payload")
         return {'ok': True, 'ignored': True, 'reason': 'Payload is not an object'}
 
-    # Unwrap common provider envelope shapes.
+    # Unwrap nested provider envelopes. DoubleTick integrations can deliver
+    # the event directly or inside data/payload/body/eventData.
     event_data = payload
-    for wrapper_key in ('data', 'payload', 'body', 'eventData'):
-        nested = event_data.get(wrapper_key)
-        if isinstance(nested, str):
-            try: nested = json.loads(nested)
-            except Exception: pass
-        if isinstance(nested, dict) and any(
-            k in nested for k in ('event', 'eventType', 'type', 'from', 'sender',
-                                  'message', 'text', 'messages', 'contacts', 'newStatus')
-        ):
-            event_data = nested
+    for _ in range(5):
+        if not isinstance(event_data, dict):
+            break
+        nested_found = None
+        for wrapper_key in ('data', 'payload', 'body', 'eventData', 'event_data'):
+            nested = event_data.get(wrapper_key)
+            if isinstance(nested, str):
+                try:
+                    nested = json.loads(nested)
+                except Exception:
+                    continue
+            if isinstance(nested, dict):
+                event_data = nested
+                nested_found = nested
+                break
+            if isinstance(nested, list) and nested and isinstance(nested[0], dict):
+                event_data = nested[0]
+                nested_found = event_data
+                break
+        if nested_found is None:
             break
 
-    event = str(event_data.get('event') or event_data.get('eventType') or
-                event_data.get('type') or payload.get('event') or
-                payload.get('eventType') or '').strip().upper()
+    def _walk_dicts(value):
+        """Yield dictionaries at every nesting level without assuming a fixed schema."""
+        if isinstance(value, dict):
+            yield value
+            for child in value.values():
+                yield from _walk_dicts(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from _walk_dicts(child)
+
+    all_objects = list(_walk_dicts(event_data))
+    def _first_value(keys):
+        for obj in all_objects:
+            for key in keys:
+                value = obj.get(key)
+                if value not in (None, ''):
+                    return value
+        return None
+
+    event = str(_first_value(('event', 'eventType', 'event_type', 'webhookEvent')) or '').strip().upper()
     logger.info("DoubleTick webhook received: event=%s content_type=%s top_keys=%s event_keys=%s",
                 event or 'UNKNOWN', content_type, list(payload.keys())[:30],
                 list(event_data.keys())[:30])
 
-    msg = event_data.get('message')
-    if isinstance(msg, list):
-        msg = msg[0] if msg and isinstance(msg[0], dict) else {}
-    if not isinstance(msg, dict):
-        msg = {'text': msg} if isinstance(msg, str) else {}
+    # Find the actual message object, including messages[0] and nested data shapes.
+    msg = None
+    for obj in all_objects:
+        candidate = obj.get('message')
+        if isinstance(candidate, list):
+            candidate = next((x for x in candidate if isinstance(x, dict)), None)
+        if isinstance(candidate, dict):
+            msg = candidate
+            break
+        if isinstance(candidate, str) and candidate.strip():
+            msg = {'text': candidate}
+            break
+    if msg is None:
+        msg = event_data if isinstance(event_data, dict) else {}
 
-    contact = event_data.get('contact') if isinstance(event_data.get('contact'), dict) else {}
-    sender_obj = event_data.get('sender') if isinstance(event_data.get('sender'), dict) else {}
-    customer_obj = event_data.get('customer') if isinstance(event_data.get('customer'), dict) else {}
-    phone_value = (_dt_get_nested(event_data, 'from', 'customerPhone', 'phone', 'waId',
-                                  'wa_id', 'senderPhone', 'contact.phone', 'contact.wa_id',
-                                  'sender.phone', 'sender.wa_id', 'customer.phone',
-                                  'customer.wa_id') or '')
+    contact = next((o for o in all_objects if isinstance(o.get('contact'), dict)), {})
+    customer_obj = next((o for o in all_objects if isinstance(o.get('customer'), dict)), {})
+    sender_obj = next((o for o in all_objects if isinstance(o.get('sender'), dict)), {})
+
+    phone_value = _first_value((
+        'from', 'customerPhone', 'customer_phone', 'phone', 'waId', 'wa_id',
+        'senderPhone', 'sender_phone', 'mobile', 'mobileNumber', 'phoneNumber',
+        'phone_number', 'recipientPhone'
+    )) or ''
     if isinstance(phone_value, dict):
-        phone_value = phone_value.get('phone') or phone_value.get('wa_id') or phone_value.get('number') or ''
-    phone_digits = re.sub(r'\D', '', str(phone_value))
+        phone_value = (phone_value.get('phone') or phone_value.get('wa_id') or
+                       phone_value.get('number') or phone_value.get('id') or '')
+    phone_digits = re.sub(r'\\D', '', str(phone_value))
 
     text_value = (msg.get('text') or msg.get('caption') or msg.get('body') or
-                  event_data.get('text') or event_data.get('messageText') or '')
-    if isinstance(text_value, (dict, list)):
+                  msg.get('messageText') or msg.get('message') or
+                  _first_value(('messageText', 'text', 'caption', 'body', 'textBody')) or '')
+    if isinstance(text_value, dict):
+        text_value = text_value.get('body') or text_value.get('text') or json.dumps(text_value, ensure_ascii=False)
+    if isinstance(text_value, list):
         text_value = json.dumps(text_value, ensure_ascii=False)
-    media_url = str(msg.get('url') or msg.get('mediaUrl') or msg.get('link') or
-                    event_data.get('mediaUrl') or event_data.get('media_url') or '')
-    message_type = str(msg.get('type') or event_data.get('messageType') or
-                       event_data.get('type') or 'TEXT').upper()
-    direction = str(event_data.get('direction') or event_data.get('messageDirection') or '').upper()
+
+    media_url = str(msg.get('url') or msg.get('mediaUrl') or msg.get('media_url') or
+                    msg.get('link') or _first_value(('mediaUrl', 'media_url', 'mediaLink', 'media_link', 'fileUrl')) or '')
+    message_type = str(msg.get('type') or msg.get('messageType') or
+                       _first_value(('messageType', 'message_type')) or 'TEXT').upper()
+    direction = str(_first_value(('direction', 'messageDirection', 'message_direction')) or '').upper()
     incoming_event = any(term in event for term in
                          ('MESSAGE_RECEIVED', 'INCOMING', 'INBOUND', 'MESSAGE_IN',
-                          'MESSAGES.UPSERT', 'MESSAGE.NEW', 'NEW_MESSAGE'))
-    is_incoming = incoming_event or direction in ('IN', 'INBOUND', 'INCOMING') or (
+                          'MESSAGES.UPSERT', 'MESSAGE.NEW', 'NEW_MESSAGE', 'RECEIVED'))
+    is_incoming = incoming_event or direction in ('IN', 'INBOUND', 'INCOMING', 'RECEIVED') or (
         bool(phone_digits) and bool(text_value or media_url) and
-        not any(term in event for term in ('STATUS', 'DELIVERED', 'READ', 'FAILED', 'TEMPLATE'))
+        not any(term in event for term in ('STATUS', 'DELIVERED', 'READ', 'FAILED', 'TEMPLATE', 'SENT'))
     )
 
     if is_incoming:
@@ -740,12 +784,12 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
                            list(event_data.keys())[:30])
             return {'ok': True, 'ignored': True, 'reason': 'Sender phone missing'}
         candidate_name = str(contact.get('name') or customer_obj.get('name') or
-                             event_data.get('customerName') or event_data.get('name') or
+                             _first_value(('customerName', 'customer_name', 'profileName', 'pushName', 'name')) or
                              phone_digits)[:200]
         if not text_value:
             text_value = f'[{message_type}]' if media_url else f'[{message_type} message]'
-        message_id = str(event_data.get('dtMessageId') or event_data.get('messageId') or
-                         event_data.get('id') or msg.get('messageId') or msg.get('id') or '').strip()
+        message_id = str(msg.get('dtMessageId') or msg.get('messageId') or msg.get('id') or
+                         _first_value(('dtMessageId', 'messageId', 'message_id', 'wamid')) or '').strip()
 
         c = db()
         try:

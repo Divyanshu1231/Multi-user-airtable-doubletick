@@ -990,14 +990,11 @@ def _proxy_template_payload(candidate, template_name, language=None):
         "language": (language or os.getenv("WHATSAPP_TEMPLATE_LANGUAGE", "en")).strip(),
     }
 
-    csv_variables = candidate.get("_template_variables") if isinstance(candidate, dict) else None
-    if isinstance(csv_variables, list):
+    if variables:
         payload["templateData"] = {
-            "body": {"placeholders": [clean_airtable_value(v) for v in csv_variables]}
-        }
-    elif variables:
-        payload["templateData"] = {
-            "body": {"placeholders": [values.get(v, "") for v in variables]}
+            "body": {
+                "placeholders": [values.get(v, "") for v in variables]
+            }
         }
 
     button_type = os.getenv(
@@ -1025,7 +1022,7 @@ def _proxy_template_payload(candidate, template_name, language=None):
     return payload
 
 
-def send_doubletick_candidate_message(candidate, template_name, language=None, header_media_url=''):
+def send_doubletick_candidate_message(candidate, template_name, language=None):
     """Send one candidate message through the existing Cloudflare proxy."""
     if not DOUBLETICK_URL:
         raise RuntimeError(
@@ -1033,9 +1030,6 @@ def send_doubletick_candidate_message(candidate, template_name, language=None, h
         )
 
     payload = _proxy_template_payload(candidate, template_name, language)
-    media_url = str(header_media_url or (candidate.get("_template_header_media_url") if isinstance(candidate, dict) else "") or "").strip()
-    if media_url:
-        payload.setdefault("templateData", {})["header"] = {"type": "IMAGE", "mediaUrl": media_url}
 
     try:
         response = requests.post(

@@ -175,6 +175,7 @@ def replace_vars(text,c):
     return re.sub(r'\{\{\s*([a-zA-Z_]+)\s*\}\}',lambda m:str(d.get(m.group(1).lower(),'')),text)
 
 class Login(BaseModel): username:str; password:str
+class AdminPasswordChange(BaseModel): current_password:str; new_password:str=Field(min_length=8, max_length=128)
 class UserCreate(BaseModel): username:str; password:str=Field(min_length=8)
 class UserUpdate(BaseModel): password:Optional[str]=None; active:Optional[bool]=None
 class AirtableConfig(BaseModel): urls:list[str]=[]; max_messages_per_user_per_day:int=50
@@ -202,18 +203,10 @@ def startup():
                 print('INITIAL ADMIN PASSWORD was generated. Set ADMIN_PASSWORD in Render Environment.')
             c.execute("INSERT INTO users(username,password_hash,role,active) VALUES(?,?,'admin',1)",(username,phash(password)))
             c.commit()
-        elif password:
-            # Fixes the common case where the database was initialized before
-            # ADMIN_PASSWORD was added to Render. Update only the admin login row.
-            # If the requested username belongs to an HR account, do not overwrite it.
-            name_owner=c.execute('SELECT id,role FROM users WHERE username=?',(username,)).fetchone()
-            if name_owner and name_owner['id'] != admin_row['id']:
-                print('ADMIN CREDENTIAL SYNC skipped: ADMIN_USERNAME is already used by another account.')
-            else:
-                c.execute('UPDATE users SET username=?, password_hash=?, active=1 WHERE id=?',
-                          (username,phash(password),admin_row['id']))
-                c.commit()
-                print('Admin login credentials synchronized from Render Environment Variables.')
+        else:
+            # Do not overwrite an existing admin password on every restart.
+            # This allows the admin to securely change their password in the dashboard.
+            print('Existing admin credentials retained; use the dashboard to change the password.')
     finally:
         c.close()
 
@@ -228,6 +221,20 @@ def login(x:Login):
     return {'token':token(u['id'],u['role']),'user':{'id':u['id'],'username':u['username'],'role':u['role']}}
 @app.get('/api/me')
 def me(u=Depends(current_user)): return u
+@app.post('/api/me/change-password')
+def change_admin_password(x:AdminPasswordChange,u=Depends(admin)):
+    c=db()
+    try:
+        row=c.execute('SELECT password_hash FROM users WHERE id=? AND role=\'admin\'',(u['id'],)).fetchone()
+        if not row or not verify(x.current_password,row['password_hash']):
+            raise HTTPException(400,'Current password is incorrect.')
+        if x.current_password == x.new_password:
+            raise HTTPException(400,'New password must be different from the current password.')
+        c.execute('UPDATE users SET password_hash=? WHERE id=?',(phash(x.new_password),u['id']))
+        c.commit()
+        return {'ok':True,'message':'Admin password changed successfully.'}
+    finally:
+        c.close()
 @app.get('/api/admin/config')
 def config(u=Depends(admin)):
     urls=airtable_urls()

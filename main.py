@@ -755,7 +755,7 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
     if isinstance(phone_value, dict):
         phone_value = (phone_value.get('phone') or phone_value.get('wa_id') or
                        phone_value.get('number') or phone_value.get('id') or '')
-    phone_digits = re.sub(r'\\D', '', str(phone_value))
+    phone_digits = re.sub(r'\D', '', str(phone_value))
 
     text_value = (msg.get('text') or msg.get('caption') or msg.get('body') or
                   msg.get('messageText') or msg.get('message') or
@@ -773,7 +773,15 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
     incoming_event = any(term in event for term in
                          ('MESSAGE_RECEIVED', 'INCOMING', 'INBOUND', 'MESSAGE_IN',
                           'MESSAGES.UPSERT', 'MESSAGE.NEW', 'NEW_MESSAGE', 'RECEIVED'))
-    is_incoming = incoming_event or direction in ('IN', 'INBOUND', 'INCOMING', 'RECEIVED') or (
+    # DoubleTick's CleverTap Incoming Messages webhook uses a flat payload:
+    # {from, wabaNumber, messageId, timestamp, type, text:{body}} and may not
+    # include an event/status field. Recognize this provider signature directly.
+    clevertap_incoming = bool(
+        event_data.get('from') and event_data.get('wabaNumber') and
+        event_data.get('messageId') and
+        (isinstance(event_data.get('text'), dict) or isinstance(event_data.get('text'), str))
+    )
+    is_incoming = incoming_event or clevertap_incoming or direction in ('IN', 'INBOUND', 'INCOMING', 'RECEIVED') or (
         bool(phone_digits) and bool(text_value or media_url) and
         not any(term in event for term in ('STATUS', 'DELIVERED', 'READ', 'FAILED', 'TEMPLATE', 'SENT'))
     )

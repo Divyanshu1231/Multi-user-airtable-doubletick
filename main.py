@@ -1,7 +1,7 @@
-import os, re, json, hmac, hashlib, secrets, sqlite3, time, requests, threading, copy, uuid
+import os, re, json, hmac, hashlib, secrets, sqlite3, time, requests, threading, copy, uuid, csv, io
 from pathlib import Path
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Depends, Header, Request
+from fastapi import FastAPI, HTTPException, Depends, Header, Request, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -61,7 +61,7 @@ def db():
         c.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         c.execute("CREATE TABLE IF NOT EXISTS templates(id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL, template_name TEXT DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         existing={r['name'] for r in c.execute("SELECT column_name AS name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='templates'").fetchall()}
-        for col,ddl in {'language':"TEXT DEFAULT 'en'",'category':"TEXT DEFAULT 'MARKETING'",'approval_status':"TEXT DEFAULT 'DRAFT'",'header_text':"TEXT DEFAULT ''",'footer_text':"TEXT DEFAULT ''",'provider_detail':"TEXT DEFAULT ''",'submitted_at':"TEXT DEFAULT ''"}.items():
+        for col,ddl in {'language':"TEXT DEFAULT 'en'",'category':"TEXT DEFAULT 'MARKETING'",'approval_status':"TEXT DEFAULT 'DRAFT'",'header_text':"TEXT DEFAULT ''",'footer_text':"TEXT DEFAULT ''",'provider_detail':"TEXT DEFAULT ''",'submitted_at':"TEXT DEFAULT ''",'header_media_url':"TEXT DEFAULT ''"}.items():
             if col not in existing: c.execute(f'ALTER TABLE templates ADD COLUMN {col} {ddl}')
         c.execute("CREATE TABLE IF NOT EXISTS chat_messages(id BIGSERIAL PRIMARY KEY, user_id BIGINT, phone TEXT NOT NULL, candidate_name TEXT DEFAULT '', direction TEXT NOT NULL, message_type TEXT DEFAULT 'TEXT', content TEXT DEFAULT '', media_url TEXT DEFAULT '', provider_message_id TEXT DEFAULT '', status TEXT DEFAULT 'RECEIVED', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         chat_cols={r['name'] for r in c.execute("SELECT column_name AS name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='chat_messages'").fetchall()}
@@ -76,7 +76,7 @@ def db():
     c.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     c.execute("CREATE TABLE IF NOT EXISTS templates(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL, template_name TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
     existing={r['name'] for r in c.execute('PRAGMA table_info(templates)').fetchall()}
-    for col,ddl in {'language':"TEXT DEFAULT 'en'",'category':"TEXT DEFAULT 'MARKETING'",'approval_status':"TEXT DEFAULT 'DRAFT'",'header_text':"TEXT DEFAULT ''",'footer_text':"TEXT DEFAULT ''",'provider_detail':"TEXT DEFAULT ''",'submitted_at':"TEXT DEFAULT ''"}.items():
+    for col,ddl in {'language':"TEXT DEFAULT 'en'",'category':"TEXT DEFAULT 'MARKETING'",'approval_status':"TEXT DEFAULT 'DRAFT'",'header_text':"TEXT DEFAULT ''",'footer_text':"TEXT DEFAULT ''",'provider_detail':"TEXT DEFAULT ''",'submitted_at':"TEXT DEFAULT ''",'header_media_url':"TEXT DEFAULT ''"}.items():
         if col not in existing: c.execute(f'ALTER TABLE templates ADD COLUMN {col} {ddl}')
     c.execute("CREATE TABLE IF NOT EXISTS chat_messages(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, phone TEXT NOT NULL, candidate_name TEXT DEFAULT '', direction TEXT NOT NULL, message_type TEXT DEFAULT 'TEXT', content TEXT DEFAULT '', media_url TEXT DEFAULT '', provider_message_id TEXT DEFAULT '', status TEXT DEFAULT 'RECEIVED', created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
     chat_cols={r['name'] for r in c.execute('PRAGMA table_info(chat_messages)').fetchall()}
@@ -183,7 +183,7 @@ class UserUpdate(BaseModel): password:Optional[str]=None; active:Optional[bool]=
 class AirtableConfig(BaseModel): urls:list[str]=[]; max_messages_per_user_per_day:int=50
 class TemplateIn(BaseModel):
     name:str; kind:str='custom'; content:str; template_name:str=''
-    language:str='en'; category:str='MARKETING'; header_text:str=''; footer_text:str=''
+    language:str='en'; category:str='MARKETING'; header_text:str=''; footer_text:str=''; header_media_url:str=''; header_format:str='TEXT'
 class SendIn(BaseModel): candidate_ids:list[str]; kind:str; template_name:str=''; message:str=''; language:str='en'
 class ChatReplyIn(BaseModel): message:str=Field(min_length=1,max_length=4000)
 
@@ -310,6 +310,32 @@ def candidates(
 def templates(u=Depends(current_user)):
     c=db(); rows=c.execute('SELECT * FROM templates WHERE user_id=? ORDER BY id DESC',(u['id'],)).fetchall(); c.close(); return [dict(r) for r in rows]
 
+@app.post('/api/templates/upload-image')
+async def upload_template_image(file:UploadFile=File(...), u=Depends(current_user)):
+    """Upload an image sample to DoubleTick for an IMAGE template header."""
+    filename=(file.filename or 'template-image').strip()
+    if not os.getenv('DOUBLETICK_API_KEY','').strip(): raise HTTPException(503,'DOUBLETICK_API_KEY is not configured on the backend.')
+    content_type=(file.content_type or '').lower()
+    if content_type not in ('image/jpeg','image/png') and not filename.lower().endswith(('.jpg','.jpeg','.png')):
+        raise HTTPException(400,'Please upload a JPG or PNG image.')
+    data=await file.read(5*1024*1024+1)
+    if not data: raise HTTPException(400,'Selected image is empty.')
+    if len(data)>5*1024*1024: raise HTTPException(413,'Image must be 5 MB or smaller.')
+    if content_type not in ('image/jpeg','image/png'):
+        content_type='image/png' if filename.lower().endswith('.png') else 'image/jpeg'
+    try:
+        resp=requests.post('https://public.doubletick.io/media/upload',
+            headers={'Authorization':os.getenv('DOUBLETICK_API_KEY','').strip(),'Accept':'application/json'},
+            files={'file':(filename,data,content_type)}, timeout=45)
+    except requests.RequestException as exc:
+        raise HTTPException(502,'DoubleTick media upload connection failed: '+str(exc))
+    try: body=resp.json()
+    except Exception: body={'raw':resp.text[:1000]}
+    if not resp.ok: raise HTTPException(resp.status_code,f'DoubleTick media upload failed: {body}')
+    media_url=body.get('mediaUrl') or body.get('url')
+    if not media_url: raise HTTPException(502,f'DoubleTick upload response did not contain mediaUrl: {body}')
+    return {'ok':True,'media_url':media_url,'expires_in':body.get('expiresIn'),'filename':filename}
+
 @app.post('/api/templates')
 def save_template(x:TemplateIn,u=Depends(current_user)):
     if x.kind not in ('approved','custom'): raise HTTPException(400,'Template kind must be approved or custom')
@@ -317,7 +343,9 @@ def save_template(x:TemplateIn,u=Depends(current_user)):
     if len(x.content.strip())>1024: raise HTTPException(400,'WhatsApp template body must be 1024 characters or fewer')
     if x.language.strip() not in ('en','hi','en_US','hi_IN'): raise HTTPException(400,'Use a supported language code such as en or hi')
     if x.category.upper() not in ('MARKETING','UTILITY'): raise HTTPException(400,'Category must be MARKETING or UTILITY')
-    c=db(); c.execute('INSERT INTO templates(user_id,name,kind,content,template_name,language,category,approval_status,header_text,footer_text) VALUES(?,?,?,?,?,?,?,?,?,?)',(u['id'],x.name.strip(),x.kind,x.content.strip(),x.template_name.strip(),x.language.strip(),x.category.upper(),'DRAFT',x.header_text.strip(),x.footer_text.strip())); c.commit(); c.close(); return {'ok':True}
+    if x.header_media_url and x.header_text.strip(): raise HTTPException(400,'Use either an image header or a text header, not both.')
+    if x.header_media_url and not x.header_media_url.startswith('https://'): raise HTTPException(400,'Uploaded image URL must be HTTPS.')
+    c=db(); c.execute('INSERT INTO templates(user_id,name,kind,content,template_name,language,category,approval_status,header_text,footer_text,header_media_url) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(u['id'],x.name.strip(),x.kind,x.content.strip(),x.template_name.strip(),x.language.strip(),x.category.upper(),'DRAFT',x.header_text.strip(),x.footer_text.strip(),x.header_media_url.strip())); c.commit(); c.close(); return {'ok':True}
 
 
 def doubletick_headers():
@@ -349,7 +377,10 @@ def submit_template(tid:int,u=Depends(current_user)):
     if row['header_text'] and len(row['header_text'])>60: c.close(); raise HTTPException(400,'Header must be 60 characters or fewer')
     if row['footer_text'] and len(row['footer_text'])>60: c.close(); raise HTTPException(400,'Footer must be 60 characters or fewer')
     components={'body':{'text':row['content']}}
-    if row['header_text']: components['header']={'format':'TEXT','text':row['header_text']}
+    if row['header_media_url']:
+        components['header']={'format':'IMAGE','example':{'link':row['header_media_url']}}
+    elif row['header_text']:
+        components['header']={'format':'TEXT','text':row['header_text']}
     if row['footer_text']: components['footer']={'text':row['footer_text']}
     payload={'name':name,'language':row['language'] or 'en','category':row['category'] or 'MARKETING','allowCategoryUpdate':True,'wabaNumbers':[dt_sender_number()],'components':components}
     try:
@@ -582,7 +613,9 @@ def send(x:SendIn,u=Depends(current_user)):
     for r,log_id in zip(found,ids):
         f=candidate_fields(r); status='FAILED'; detail=''; provider_id=''
         try:
-            response=send_doubletick_candidate_message(r,x.template_name.strip(),x.language.strip() or 'en')
+            template_row=c.execute("SELECT header_media_url FROM templates WHERE user_id=? AND LOWER(template_name)=LOWER(?) AND approval_status='APPROVED' ORDER BY id DESC LIMIT 1",(u['id'],x.template_name.strip())).fetchone()
+            media_url=template_row['header_media_url'] if template_row else ''
+            response=send_doubletick_candidate_message(r,x.template_name.strip(),x.language.strip() or 'en',header_media_url=media_url)
             provider_id=_find_provider_message_id(response)
             provider_status,provider_error=_find_provider_status(response)
             if provider_status=='FAILED':
@@ -606,6 +639,130 @@ def send(x:SendIn,u=Depends(current_user)):
         results.append({'name':str(f.get('name') or ''),'status':current_status if current_status in final_states else status,'detail':detail,'message_id':provider_id})
     c.close()
     return {'ok':True,'summary':{'total':len(results),'sent':sum(z['status'] in ('SENT','DELIVERED','READ','ENQUEUED') for z in results),'failed':sum(z['status']=='FAILED' for z in results),'enqueued':sum(z['status']=='ENQUEUED' for z in results)},'results':results}
+
+def _read_csv_upload(data:bytes):
+    if len(data)>5*1024*1024: raise HTTPException(413,'CSV file must be 5 MB or smaller.')
+    try: text=data.decode('utf-8-sig')
+    except UnicodeDecodeError: raise HTTPException(400,'CSV must be UTF-8 encoded. Export CSV as UTF-8 from Airtable.')
+    if not text.strip(): raise HTTPException(400,'CSV file is empty.')
+    try:
+        dialect=csv.Sniffer().sniff(text[:4096], delimiters=',;\t')
+        reader=csv.DictReader(io.StringIO(text), dialect=dialect)
+    except Exception: reader=csv.DictReader(io.StringIO(text))
+    columns=[str(x or '').strip() for x in (reader.fieldnames or [])]
+    if not columns: raise HTTPException(400,'CSV header row is missing.')
+    rows=[]
+    for raw in reader:
+        row={str(k or '').strip():str(v or '').strip() for k,v in raw.items() if k is not None}
+        if any(row.values()): rows.append(row)
+    if len(rows)>100: raise HTTPException(400,'CSV contains more than 100 rows per batch. Split it into smaller files to avoid request timeouts.')
+    return columns,rows
+
+@app.post('/api/csv/preview')
+async def preview_csv(file:UploadFile=File(...), u=Depends(current_user)):
+    data=await file.read(5*1024*1024+1)
+    columns,rows=_read_csv_upload(data)
+    return {'columns':columns,'row_count':len(rows),'preview':rows[:5]}
+
+@app.post('/api/csv/send')
+async def send_csv(
+    file:UploadFile=File(...), template_id:int=Form(...), name_column:str=Form(''),
+    phone_column:str=Form(...), variables_json:str=Form('[]'), header_image:UploadFile=File(None), u=Depends(current_user)
+):
+    data=await file.read(5*1024*1024+1)
+    columns,rows=_read_csv_upload(data)
+    if not rows: raise HTTPException(400,'CSV has no data rows.')
+    if phone_column not in columns: raise HTTPException(400,'Selected phone column is not present in the CSV.')
+    try: variable_columns=json.loads(variables_json or '[]')
+    except Exception: raise HTTPException(400,'Invalid template variable mapping.')
+    if not isinstance(variable_columns,list) or any(x and x not in columns for x in variable_columns):
+        raise HTTPException(400,'One or more template variable columns are not present in the CSV.')
+    c=db()
+    template=c.execute("SELECT * FROM templates WHERE id=? AND user_id=?",(template_id,u['id'])).fetchone()
+    if not template: c.close(); raise HTTPException(404,'Template not found.')
+    if str(template['approval_status'] or '').upper()!='APPROVED':
+        c.close(); raise HTTPException(400,'Only APPROVED WhatsApp templates can be sent.')
+    batch_header_media_url=template['header_media_url'] or ''
+    if batch_header_media_url:
+        if header_image is None:
+            c.close(); raise HTTPException(400,'This is an image-header template. Upload the same JPG/PNG image again for this send batch so the media link is fresh.')
+        image_name=(header_image.filename or 'template-image').strip()
+        image_type=(header_image.content_type or '').lower()
+        if image_type not in ('image/jpeg','image/png') and not image_name.lower().endswith(('.jpg','.jpeg','.png')):
+            c.close(); raise HTTPException(400,'Batch header image must be JPG or PNG.')
+        image_data=await header_image.read(5*1024*1024+1)
+        if not image_data or len(image_data)>5*1024*1024:
+            c.close(); raise HTTPException(400,'Batch header image must be non-empty and 5 MB or smaller.')
+        if image_type not in ('image/jpeg','image/png'):
+            image_type='image/png' if image_name.lower().endswith('.png') else 'image/jpeg'
+        try:
+            upload_resp=requests.post('https://public.doubletick.io/media/upload',
+                headers={'Authorization':os.getenv('DOUBLETICK_API_KEY','').strip(),'Accept':'application/json'},
+                files={'file':(image_name,image_data,image_type)},timeout=45)
+            upload_body=upload_resp.json()
+        except Exception as exc:
+            c.close(); raise HTTPException(502,'Could not upload batch image to DoubleTick: '+str(exc))
+        if not upload_resp.ok or not (upload_body.get('mediaUrl') or upload_body.get('url')):
+            c.close(); raise HTTPException(502,f'DoubleTick batch image upload failed: {upload_body}')
+        batch_header_media_url=upload_body.get('mediaUrl') or upload_body.get('url')
+    expected_vars=len(re.findall(r'\{\{\s*\d+\s*\}\}',template['content'] or ''))
+    if expected_vars and len(variable_columns)!=expected_vars:
+        c.close(); raise HTTPException(400,f'This template needs {expected_vars} variable column(s).')
+    prepared=[]; skipped=[]
+    for index,row in enumerate(rows,start=2):
+        digits=re.sub(r'\D','',row.get(phone_column,''))
+        if len(digits)==10: digits='91'+digits
+        if not (10<=len(digits)<=15):
+            skipped.append({'row':index,'reason':'Missing/invalid phone'}); continue
+        name=row.get(name_column,'') if name_column else ''
+        candidate={'Candidate Name':name,'Mobile Number':'+'+digits,'Phone':'+'+digits,
+                   '_template_variables':[row.get(col,'') if col else '' for col in variable_columns]}
+        prepared.append((candidate,index))
+    if not prepared:
+        c.close(); raise HTTPException(400,'No valid phone numbers found in the selected CSV column.')
+    if u['role']!='admin':
+        limit=int(get_setting('max_messages_per_user_per_day','50'))
+        if DATABASE_URL:
+            used=c.execute("SELECT COUNT(*) n FROM logs WHERE user_id=? AND (created_at + interval '5 hours 30 minutes')::date=(CURRENT_TIMESTAMP + interval '5 hours 30 minutes')::date",(u['id'],)).fetchone()['n']
+        else:
+            used=c.execute("SELECT COUNT(*) n FROM logs WHERE user_id=? AND date(created_at,'+5 hours','+30 minutes')=date('now','+5 hours','+30 minutes')",(u['id'],)).fetchone()['n']
+        remaining=max(0,limit-used)
+        if len(prepared)>remaining:
+            c.close(); raise HTTPException(429,f'Daily WhatsApp limit reached. You can send {remaining} more message(s) today; CSV has {len(prepared)} valid recipients.')
+    ids=[]
+    for candidate,_ in prepared:
+        cur=c.execute("INSERT INTO logs(user_id,candidate_name,phone,kind,template_name,status,detail) VALUES(?,?,?,?,?,'PROCESSING','CSV upload send reserved')",
+                      (u['id'],candidate['Candidate Name'],candidate['Mobile Number'],'approved',template['template_name']))
+        ids.append(cur.lastrowid)
+    c.commit()
+    results=[]
+    for (candidate,rownum),log_id in zip(prepared,ids):
+        status='FAILED'; detail=''; provider_id=''
+        try:
+            response=send_doubletick_candidate_message(candidate,template['template_name'],template['language'] or 'en',
+                                                       header_media_url=batch_header_media_url)
+            provider_id=_find_provider_message_id(response)
+            provider_status,provider_error=_find_provider_status(response)
+            if provider_status=='FAILED':
+                status='FAILED'; detail=provider_error or json.dumps(response,ensure_ascii=False)[:1200]
+            elif provider_status in ('SENT','DELIVERED','READ','ENQUEUED'):
+                status=provider_status; detail=json.dumps(response,ensure_ascii=False)[:1200]
+            else:
+                status='ENQUEUED'; detail=json.dumps(response,ensure_ascii=False)[:1200]
+        except Exception as exc: detail=str(exc)[:1200]
+        current=c.execute('SELECT status FROM logs WHERE id=?',(log_id,)).fetchone()
+        current_status=str(current['status'] or '') if current else ''
+        if current_status not in ('SENT','DELIVERED','READ','FAILED'):
+            c.execute('UPDATE logs SET status=?,detail=?,provider_message_id=?,status_updated_at=CURRENT_TIMESTAMP WHERE id=?',(status,detail,provider_id,log_id))
+        elif provider_id: c.execute('UPDATE logs SET provider_message_id=? WHERE id=?',(provider_id,log_id))
+        c.commit()
+        results.append({'row':rownum,'name':candidate['Candidate Name'],'phone':candidate['Mobile Number'],
+                        'status':current_status if current_status in ('SENT','DELIVERED','READ','FAILED') else status,'detail':detail})
+    c.close()
+    return {'ok':True,'summary':{'total':len(results),'sent':sum(x['status'] in ('SENT','DELIVERED','READ','ENQUEUED') for x in results),
+                                  'failed':sum(x['status']=='FAILED' for x in results),'skipped':len(skipped)},
+            'skipped':skipped,'results':results}
+
 def _e164(value):
     digits=re.sub(r'\D','',str(value or ''))
     if len(digits)==10: digits='91'+digits

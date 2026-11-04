@@ -1,4 +1,4 @@
-import os, re, json, hmac, hashlib, secrets, sqlite3, time, requests, threading, copy
+import os, re, json, hmac, hashlib, secrets, sqlite3, time, requests, threading, copy, uuid
 from pathlib import Path
 from typing import Optional
 import csv, io
@@ -184,6 +184,7 @@ class TemplateIn(BaseModel):
 class SendIn(BaseModel): candidate_ids:list[str]; kind:str; template_name:str=''; message:str=''; language:str='en'
 class CsvPreviewIn(BaseModel): upload_id:str
 class CsvSendIn(BaseModel): upload_id:str; candidate_ids:list[str]; template_name:str; language:str='en'; confirm_opt_in:bool=False
+class ChatReplyIn(BaseModel): message:str=Field(min_length=1,max_length=4000)
 
 @app.on_event('startup')
 def startup():
@@ -591,12 +592,17 @@ def _find_provider_status(value):
 
 @app.post('/api/webhooks/doubletick')
 async def doubletick_webhook(request:Request, x_webhook_secret:Optional[str]=Header(None)):
-    """Receive DoubleTick TEMPLATE_UPDATE and MESSAGE_STATUS_UPDATE events."""
+    """Receive DoubleTick events. Accept the configured secret via query token or header."""
     expected=os.getenv('DOUBLETICK_WEBHOOK_SECRET','').strip()
     if not expected:
         raise HTTPException(503,'DOUBLETICK_WEBHOOK_SECRET is not configured.')
-    if not x_webhook_secret or not hmac.compare_digest(x_webhook_secret,expected):
-        raise HTTPException(401,'Invalid webhook secret')
+    # Supports the URL format registered in DoubleTick: /api/webhooks/doubletick?token=...
+    # Also keeps backward compatibility with the x-webhook-secret header.
+    query_token=request.query_params.get('token','').strip()
+    header_token=(x_webhook_secret or '').strip()
+    supplied_token=query_token or header_token
+    if not supplied_token or not hmac.compare_digest(supplied_token,expected):
+        raise HTTPException(401,'Invalid webhook token')
     try: payload=await request.json()
     except Exception: raise HTTPException(400,'Webhook body must be valid JSON')
     if not isinstance(payload,dict): raise HTTPException(400,'Webhook payload must be a JSON object')
@@ -728,6 +734,57 @@ def send(x:SendIn,u=Depends(current_user)):
         results.append({'name':str(f.get('name') or ''),'status':current_status if current_status in final_states else status,'detail':detail,'message_id':provider_id})
     c.close()
     return {'ok':True,'summary':{'total':len(results),'sent':sum(z['status'] in ('SENT','DELIVERED','READ','ENQUEUED') for z in results),'failed':sum(z['status']=='FAILED' for z in results),'enqueued':sum(z['status']=='ENQUEUED' for z in results)},'results':results}
+
+
+def _reply_e164(value):
+    digits=re.sub(r'\D','',str(value or ''))
+    if len(digits)==10: digits='91'+digits
+    return '+'+digits if 10<=len(digits)<=15 else ''
+
+@app.post('/api/chats/{phone}/reply')
+def send_chat_reply(phone:str, x:ChatReplyIn, u=Depends(current_user)):
+    """Send a free-form WhatsApp reply through DoubleTick (24-hour session only)."""
+    digits=re.sub(r'\D','',phone)
+    message=x.message.strip()
+    if not digits or not message: raise HTTPException(400,'Phone number and reply message are required.')
+    api_key=os.getenv('DOUBLETICK_API_KEY','').strip()
+    sender=_reply_e164(os.getenv('DOUBLETICK_SENDER_NUMBER') or os.getenv('DOUBLETICK_WABA_NUMBER') or '')
+    recipient=_reply_e164(digits)
+    if not api_key: raise HTTPException(503,'DOUBLETICK_API_KEY is not configured on the server.')
+    if not sender: raise HTTPException(503,'Set DOUBLETICK_SENDER_NUMBER (your WhatsApp sender number) in Render.')
+    if not recipient: raise HTTPException(400,'Candidate phone number must be a valid international number.')
+    c=db()
+    if u['role']!='admin':
+        if DATABASE_URL:
+            allowed=c.execute("SELECT 1 FROM logs WHERE user_id=? AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? LIMIT 1",(u['id'],digits[-10:])).fetchone()
+        else:
+            allowed=c.execute("SELECT 1 FROM logs WHERE user_id=? AND substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? LIMIT 1",(u['id'],digits[-10:])).fetchone()
+        if not allowed:
+            c.close(); raise HTTPException(403,'This conversation is not assigned to your HR account.')
+    msg_id=str(uuid.uuid4())
+    payload={'to':recipient,'from':sender,'messageId':msg_id,'content':{'text':message}}
+    try:
+        resp=requests.post('https://public.doubletick.io/whatsapp/message/text',
+            headers={'Authorization':api_key,'Content-Type':'application/json','Accept':'application/json'},json=payload,timeout=30)
+        try: body=resp.json()
+        except Exception: body={'raw':resp.text[:1500]}
+    except requests.RequestException as exc:
+        c.close(); raise HTTPException(502,f'DoubleTick connection failed: {exc}')
+    if resp.status_code not in (200,201,202):
+        c.close(); detail=body.get('message') or body.get('error') or body
+        raise HTTPException(resp.status_code if 400<=resp.status_code<500 else 502,
+            f'DoubleTick rejected reply. Free-form replies require an active 24-hour customer service window. Provider response: {detail}')
+    provider_id=_find_provider_message_id(body) or msg_id
+    if DATABASE_URL:
+        name_row=c.execute("SELECT candidate_name FROM logs WHERE RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? ORDER BY id DESC LIMIT 1",(digits[-10:],)).fetchone()
+    else:
+        name_row=c.execute("SELECT candidate_name FROM logs WHERE substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? ORDER BY id DESC LIMIT 1",(digits[-10:],)).fetchone()
+    candidate_name=name_row['candidate_name'] if name_row else ''
+    c.execute("INSERT INTO chat_messages(user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id) VALUES(?,?,?,?,?,?,?,?)",
+        (u['id'],digits,candidate_name,'OUT','TEXT',message,'',provider_id))
+    c.commit(); c.close()
+    return {'ok':True,'status':'SENT','message_id':provider_id,'provider':body}
+
 @app.get('/api/chats')
 def chats(u=Depends(current_user)):
     c=db()

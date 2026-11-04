@@ -590,33 +590,84 @@ def _find_provider_status(value):
             if found[0]: return found
     return '', ''
 
-@app.post('/api/webhooks/doubletick')
-async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] = Header(None)):
-    """Receive DoubleTick webhooks and safely acknowledge unsupported events."""
+def _doubletick_webhook_auth(request: Request, x_webhook_secret: Optional[str] = None):
+    """Validate the configured webhook token without logging the token itself."""
     import logging
     logger = logging.getLogger("uvicorn.error")
-
-    # Authenticate using either the URL query token or the legacy header.
     expected = os.getenv('DOUBLETICK_WEBHOOK_SECRET', '').strip()
     if not expected:
         logger.error("DoubleTick webhook secret is not configured")
         raise HTTPException(503, 'DOUBLETICK_WEBHOOK_SECRET is not configured.')
-
-    query_token = request.query_params.get('token', '').strip()
-    header_token = (x_webhook_secret or '').strip()
-    supplied_token = query_token or header_token
-    if not supplied_token or not hmac.compare_digest(supplied_token, expected):
+    supplied = (request.query_params.get('token') or x_webhook_secret or '').strip()
+    if not supplied or not hmac.compare_digest(supplied, expected):
         logger.warning("DoubleTick webhook authentication failed")
         raise HTTPException(401, 'Invalid webhook token')
 
-    # Read raw body once. This also lets us log useful diagnostics for bad payloads.
+
+@app.get('/api/webhooks/doubletick')
+async def doubletick_webhook_verify(request: Request,
+                                    x_webhook_secret: Optional[str] = Header(None)):
+    """Support provider URL-verification/health checks that use GET."""
+    _doubletick_webhook_auth(request, x_webhook_secret)
+    return {'ok': True, 'webhook': 'DoubleTick', 'method': 'GET',
+            'message': 'Webhook URL is reachable. Send events using POST.'}
+
+
+def _dt_get_nested(obj, *paths):
+    for path in paths:
+        value = obj
+        for key in path.split('.'):
+            if isinstance(value, dict):
+                value = value.get(key)
+            elif isinstance(value, list) and key.isdigit() and int(key) < len(value):
+                value = value[int(key)]
+            else:
+                value = None
+                break
+        if value not in (None, ''):
+            return value
+    return None
+
+
+@app.post('/api/webhooks/doubletick')
+async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] = Header(None)):
+    """Receive DoubleTick webhooks; accept JSON and form-encoded provider payloads."""
+    import logging
+    from urllib.parse import parse_qs
+    logger = logging.getLogger("uvicorn.error")
+    _doubletick_webhook_auth(request, x_webhook_secret)
+
     raw_body = await request.body()
-    try:
-        payload = json.loads(raw_body.decode('utf-8-sig'))
-    except Exception as exc:
-        logger.error("DoubleTick webhook invalid JSON: %s; content_type=%s",
-                     str(exc), request.headers.get('content-type', ''))
-        raise HTTPException(400, 'Webhook body must be valid JSON')
+    content_type = request.headers.get('content-type', '').lower()
+    payload = None
+    if raw_body:
+        try:
+            payload = json.loads(raw_body.decode('utf-8-sig'))
+        except Exception as json_exc:
+            # Some webhook senders encode the event as form data instead of JSON.
+            try:
+                decoded = raw_body.decode('utf-8-sig')
+                if 'application/x-www-form-urlencoded' in content_type or '=' in decoded:
+                    form = parse_qs(decoded, keep_blank_values=True)
+                    payload = {k: (v[-1] if v else '') for k, v in form.items()}
+                    for key in ('data', 'payload', 'message', 'body'):
+                        value = payload.get(key)
+                        if isinstance(value, str) and value.strip().startswith(('{', '[')):
+                            try: payload[key] = json.loads(value)
+                            except Exception: pass
+                else:
+                    logger.error("DoubleTick webhook invalid body: content_type=%s bytes=%s preview=%r",
+                                 content_type, len(raw_body), decoded[:300])
+                    raise HTTPException(400, 'Webhook body must be valid JSON or form data')
+            except HTTPException:
+                raise
+            except Exception:
+                logger.error("DoubleTick webhook body could not be parsed: content_type=%s bytes=%s error=%s",
+                             content_type, len(raw_body), str(json_exc))
+                raise HTTPException(400, 'Webhook body must be valid JSON or form data')
+    else:
+        logger.warning("DoubleTick webhook received an empty POST body; content_type=%s", content_type)
+        return {'ok': True, 'ignored': True, 'reason': 'Empty webhook body'}
 
     if isinstance(payload, list):
         if len(payload) == 1 and isinstance(payload[0], dict):
@@ -625,61 +676,79 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
             logger.info("DoubleTick webhook acknowledged list payload (%s items)", len(payload))
             return {'ok': True, 'ignored': True, 'reason': 'Unsupported list payload'}
     if not isinstance(payload, dict):
-        logger.info("DoubleTick webhook acknowledged non-object JSON payload")
+        logger.info("DoubleTick webhook acknowledged non-object payload")
         return {'ok': True, 'ignored': True, 'reason': 'Payload is not an object'}
 
-    # Providers sometimes wrap the event under data/payload/body.
+    # Unwrap common provider envelope shapes.
     event_data = payload
-    for wrapper_key in ('data', 'payload', 'body'):
+    for wrapper_key in ('data', 'payload', 'body', 'eventData'):
         nested = event_data.get(wrapper_key)
+        if isinstance(nested, str):
+            try: nested = json.loads(nested)
+            except Exception: pass
         if isinstance(nested, dict) and any(
-            k in nested for k in ('event', 'eventType', 'from', 'message', 'newStatus')
+            k in nested for k in ('event', 'eventType', 'type', 'from', 'sender',
+                                  'message', 'text', 'messages', 'contacts', 'newStatus')
         ):
             event_data = nested
             break
 
-    event = str(
-        event_data.get('event') or event_data.get('eventType') or
-        payload.get('event') or payload.get('eventType') or ''
-    ).strip().upper()
-    logger.info("DoubleTick webhook received: event=%s top_keys=%s event_keys=%s",
-                event or 'UNKNOWN', list(payload.keys())[:30], list(event_data.keys())[:30])
+    event = str(event_data.get('event') or event_data.get('eventType') or
+                event_data.get('type') or payload.get('event') or
+                payload.get('eventType') or '').strip().upper()
+    logger.info("DoubleTick webhook received: event=%s content_type=%s top_keys=%s event_keys=%s",
+                event or 'UNKNOWN', content_type, list(payload.keys())[:30],
+                list(event_data.keys())[:30])
 
-    msg = event_data.get('message') if isinstance(event_data.get('message'), dict) else {}
-    is_incoming = event in ('MESSAGE_RECEIVED', 'INCOMING_MESSAGE', 'MESSAGE_IN') or (
-        not event and bool(event_data.get('from') or event_data.get('customerPhone'))
-        and isinstance(event_data.get('message'), dict)
+    msg = event_data.get('message')
+    if isinstance(msg, list):
+        msg = msg[0] if msg and isinstance(msg[0], dict) else {}
+    if not isinstance(msg, dict):
+        msg = {'text': msg} if isinstance(msg, str) else {}
+
+    contact = event_data.get('contact') if isinstance(event_data.get('contact'), dict) else {}
+    sender_obj = event_data.get('sender') if isinstance(event_data.get('sender'), dict) else {}
+    customer_obj = event_data.get('customer') if isinstance(event_data.get('customer'), dict) else {}
+    phone_value = (_dt_get_nested(event_data, 'from', 'customerPhone', 'phone', 'waId',
+                                  'wa_id', 'senderPhone', 'contact.phone', 'contact.wa_id',
+                                  'sender.phone', 'sender.wa_id', 'customer.phone',
+                                  'customer.wa_id') or '')
+    if isinstance(phone_value, dict):
+        phone_value = phone_value.get('phone') or phone_value.get('wa_id') or phone_value.get('number') or ''
+    phone_digits = re.sub(r'\D', '', str(phone_value))
+
+    text_value = (msg.get('text') or msg.get('caption') or msg.get('body') or
+                  event_data.get('text') or event_data.get('messageText') or '')
+    if isinstance(text_value, (dict, list)):
+        text_value = json.dumps(text_value, ensure_ascii=False)
+    media_url = str(msg.get('url') or msg.get('mediaUrl') or msg.get('link') or
+                    event_data.get('mediaUrl') or event_data.get('media_url') or '')
+    message_type = str(msg.get('type') or event_data.get('messageType') or
+                       event_data.get('type') or 'TEXT').upper()
+    direction = str(event_data.get('direction') or event_data.get('messageDirection') or '').upper()
+    incoming_event = any(term in event for term in
+                         ('MESSAGE_RECEIVED', 'INCOMING', 'INBOUND', 'MESSAGE_IN',
+                          'MESSAGES.UPSERT', 'MESSAGE.NEW', 'NEW_MESSAGE'))
+    is_incoming = incoming_event or direction in ('IN', 'INBOUND', 'INCOMING') or (
+        bool(phone_digits) and bool(text_value or media_url) and
+        not any(term in event for term in ('STATUS', 'DELIVERED', 'READ', 'FAILED', 'TEMPLATE'))
     )
 
-    # Incoming customer WhatsApp message.
     if is_incoming:
-        phone_value = (event_data.get('from') or event_data.get('customerPhone') or
-                       event_data.get('phone') or event_data.get('sender') or '')
-        phone_digits = re.sub(r'\D', '', str(phone_value))
         if not phone_digits:
             logger.warning("DoubleTick incoming event has no sender phone; keys=%s",
                            list(event_data.keys())[:30])
-            # Acknowledge instead of making DoubleTick retry a permanently unusable event.
             return {'ok': True, 'ignored': True, 'reason': 'Sender phone missing'}
-
-        contact = event_data.get('contact') if isinstance(event_data.get('contact'), dict) else {}
-        candidate_name = str(contact.get('name') or event_data.get('customerName') or
-                             event_data.get('name') or phone_digits)[:200]
-        message_type = str(msg.get('type') or event_data.get('messageType') or 'TEXT').upper()
-        text_value = (msg.get('text') or msg.get('caption') or msg.get('body') or
-                      event_data.get('text') or event_data.get('body') or '')
-        if isinstance(text_value, (dict, list)):
-            text_value = json.dumps(text_value, ensure_ascii=False)
-        media_url = str(msg.get('url') or msg.get('mediaUrl') or msg.get('link') or
-                        event_data.get('mediaUrl') or '')
+        candidate_name = str(contact.get('name') or customer_obj.get('name') or
+                             event_data.get('customerName') or event_data.get('name') or
+                             phone_digits)[:200]
         if not text_value:
             text_value = f'[{message_type}]' if media_url else f'[{message_type} message]'
         message_id = str(event_data.get('dtMessageId') or event_data.get('messageId') or
-                         msg.get('messageId') or '').strip()
+                         event_data.get('id') or msg.get('messageId') or msg.get('id') or '').strip()
 
         c = db()
         try:
-            # Phone comparison is normalized to the last 10 digits for Indian numbers.
             if DATABASE_URL:
                 owner = c.execute(
                     "SELECT user_id,candidate_name FROM logs "
@@ -692,18 +761,15 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
                     "WHERE substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? "
                     "ORDER BY id DESC LIMIT 1", (phone_digits[-10:],)
                 ).fetchone()
-
             user_id = owner['user_id'] if owner else None
             if owner and owner['candidate_name']:
                 candidate_name = str(owner['candidate_name'])[:200]
-
             duplicate = None
             if message_id:
                 duplicate = c.execute(
                     "SELECT id FROM chat_messages WHERE provider_message_id=? "
                     "AND provider_message_id<>'' LIMIT 1", (message_id,)
                 ).fetchone()
-
             if not duplicate:
                 c.execute(
                     "INSERT INTO chat_messages(user_id,phone,candidate_name,direction,"
@@ -712,7 +778,6 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
                      str(text_value)[:5000], media_url[:2000], message_id)
                 )
                 c.commit()
-
             logger.info("DoubleTick incoming saved=%s assigned=%s type=%s phone_last4=%s",
                         not bool(duplicate), bool(user_id), message_type, phone_digits[-4:])
             return {'ok': True, 'event': 'MESSAGE_RECEIVED',
@@ -749,7 +814,8 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
     # Outbound delivery/read/failure status events.
     is_status_event = event in ('MESSAGE_STATUS_UPDATE', 'MESSAGE_STATUS',
                                 'MESSAGE_DELIVERED', 'MESSAGE_READ', 'MESSAGE_FAILED')
-    if is_status_event or (not event and (event_data.get('messageId') or event_data.get('dtMessageId'))):
+    if is_status_event or (not is_incoming and
+                           (event_data.get('messageId') or event_data.get('dtMessageId'))):
         message_id = str(event_data.get('dtMessageId') or event_data.get('messageId') or '').strip()
         status = str(event_data.get('status') or event_data.get('messageStatus') or '').strip().upper()
         if not status:
@@ -759,7 +825,6 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
             logger.info("DoubleTick status event acknowledged but ignored: event=%s status=%s",
                         event, status or 'MISSING')
             return {'ok': True, 'ignored': True, 'reason': 'Unsupported or missing status'}
-
         recipient = re.sub(r'\D', '', str(event_data.get('to') or event_data.get('recipient') or ''))
         detail = str(event_data.get('failMessage') or event_data.get('errorMessage') or
                      f'DoubleTick status update: {status}')[:1500]
@@ -794,7 +859,6 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
         return {'ok': True, 'event': 'MESSAGE_STATUS_UPDATE', 'matched': bool(target),
                 'status': status, 'message_id': message_id}
 
-    # Do not return 400 for other valid DoubleTick event types. A 200 stops retry storms.
     logger.info("DoubleTick unsupported event acknowledged: event=%s keys=%s",
                 event or 'UNKNOWN', list(event_data.keys())[:30])
     return {'ok': True, 'ignored': True, 'event': event or 'UNKNOWN'}

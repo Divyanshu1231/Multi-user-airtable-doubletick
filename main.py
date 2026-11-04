@@ -62,7 +62,7 @@ def db():
         c.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         c.execute("CREATE TABLE IF NOT EXISTS templates(id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL, template_name TEXT DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         existing={r['name'] for r in c.execute("SELECT column_name AS name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='templates'").fetchall()}
-        for col,ddl in {'language':"TEXT DEFAULT 'en'",'category':"TEXT DEFAULT 'MARKETING'",'approval_status':"TEXT DEFAULT 'DRAFT'",'header_text':"TEXT DEFAULT ''",'footer_text':"TEXT DEFAULT ''",'provider_detail':"TEXT DEFAULT ''",'submitted_at':"TEXT DEFAULT ''"}.items():
+        for col,ddl in {'language':"TEXT DEFAULT 'en'",'category':"TEXT DEFAULT 'MARKETING'",'approval_status':"TEXT DEFAULT 'DRAFT'",'header_text':"TEXT DEFAULT ''",'footer_text':"TEXT DEFAULT ''",'provider_detail':"TEXT DEFAULT ''",'submitted_at':"TEXT DEFAULT ''",'header_media_url':"TEXT DEFAULT ''"}.items():
             if col not in existing: c.execute(f'ALTER TABLE templates ADD COLUMN {col} {ddl}')
         c.execute("CREATE TABLE IF NOT EXISTS chat_messages(id BIGSERIAL PRIMARY KEY, user_id BIGINT, phone TEXT NOT NULL, candidate_name TEXT DEFAULT '', direction TEXT NOT NULL, message_type TEXT DEFAULT 'TEXT', content TEXT DEFAULT '', media_url TEXT DEFAULT '', provider_message_id TEXT DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         c.execute("CREATE TABLE IF NOT EXISTS logs(id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, candidate_name TEXT, phone TEXT, kind TEXT, template_name TEXT, status TEXT, detail TEXT, provider_message_id TEXT DEFAULT '', status_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
@@ -75,7 +75,7 @@ def db():
     c.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     c.execute("CREATE TABLE IF NOT EXISTS templates(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL, template_name TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
     existing={r['name'] for r in c.execute('PRAGMA table_info(templates)').fetchall()}
-    for col,ddl in {'language':"TEXT DEFAULT 'en'",'category':"TEXT DEFAULT 'MARKETING'",'approval_status':"TEXT DEFAULT 'DRAFT'",'header_text':"TEXT DEFAULT ''",'footer_text':"TEXT DEFAULT ''",'provider_detail':"TEXT DEFAULT ''",'submitted_at':"TEXT DEFAULT ''"}.items():
+    for col,ddl in {'language':"TEXT DEFAULT 'en'",'category':"TEXT DEFAULT 'MARKETING'",'approval_status':"TEXT DEFAULT 'DRAFT'",'header_text':"TEXT DEFAULT ''",'footer_text':"TEXT DEFAULT ''",'provider_detail':"TEXT DEFAULT ''",'submitted_at':"TEXT DEFAULT ''",'header_media_url':"TEXT DEFAULT ''"}.items():
         if col not in existing: c.execute(f'ALTER TABLE templates ADD COLUMN {col} {ddl}')
     c.execute("CREATE TABLE IF NOT EXISTS chat_messages(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, phone TEXT NOT NULL, candidate_name TEXT DEFAULT '', direction TEXT NOT NULL, message_type TEXT DEFAULT 'TEXT', content TEXT DEFAULT '', media_url TEXT DEFAULT '', provider_message_id TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
     c.execute("CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, candidate_name TEXT, phone TEXT, kind TEXT, template_name TEXT, status TEXT, detail TEXT, provider_message_id TEXT DEFAULT '', status_updated_at TEXT DEFAULT CURRENT_TIMESTAMP, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
@@ -180,7 +180,7 @@ class UserUpdate(BaseModel): password:Optional[str]=None; active:Optional[bool]=
 class AirtableConfig(BaseModel): urls:list[str]=[]; max_messages_per_user_per_day:int=50
 class TemplateIn(BaseModel):
     name:str; kind:str='custom'; content:str; template_name:str=''
-    language:str='en'; category:str='MARKETING'; header_text:str=''; footer_text:str=''
+    language:str='en'; category:str='MARKETING'; header_text:str=''; footer_text:str=''; header_media_url:str=''
 class SendIn(BaseModel): candidate_ids:list[str]; kind:str; template_name:str=''; message:str=''; language:str='en'
 class CsvPreviewIn(BaseModel): upload_id:str
 class CsvSendIn(BaseModel): upload_id:str; candidate_ids:list[str]; template_name:str; language:str='en'; confirm_opt_in:bool=False
@@ -415,6 +415,40 @@ def send_candidate_csv(x:CsvSendIn,u=Depends(current_user)):
 def templates(u=Depends(current_user)):
     c=db(); rows=c.execute('SELECT * FROM templates WHERE user_id=? ORDER BY id DESC',(u['id'],)).fetchall(); c.close(); return [dict(r) for r in rows]
 
+@app.post('/api/templates/upload-image')
+async def upload_template_image(file:UploadFile=File(...), u=Depends(current_user)):
+    """Upload a JPG/PNG sample to DoubleTick for an IMAGE template header."""
+    filename=(file.filename or 'template-image').strip()
+    key=os.getenv('DOUBLETICK_API_KEY','').strip()
+    if not key:
+        raise HTTPException(503,'DOUBLETICK_API_KEY is not configured on the backend.')
+    content_type=(file.content_type or '').lower()
+    if content_type not in ('image/jpeg','image/png') and not filename.lower().endswith(('.jpg','.jpeg','.png')):
+        raise HTTPException(400,'Please upload a JPG or PNG image.')
+    data=await file.read(5*1024*1024+1)
+    if not data:
+        raise HTTPException(400,'Selected image is empty.')
+    if len(data)>5*1024*1024:
+        raise HTTPException(413,'Image must be 5 MB or smaller.')
+    if content_type not in ('image/jpeg','image/png'):
+        content_type='image/png' if filename.lower().endswith('.png') else 'image/jpeg'
+    try:
+        resp=requests.post('https://public.doubletick.io/media/upload',
+            headers={'Authorization':key,'Accept':'application/json'},
+            files={'file':(filename,data,content_type)},timeout=45)
+    except requests.RequestException as exc:
+        raise HTTPException(502,'DoubleTick media upload connection failed: '+str(exc))
+    try:
+        body=resp.json()
+    except Exception:
+        body={'raw':resp.text[:1000]}
+    if not resp.ok:
+        raise HTTPException(resp.status_code,f'DoubleTick media upload failed: {body}')
+    media_url=body.get('mediaUrl') or body.get('url')
+    if not media_url:
+        raise HTTPException(502,f'DoubleTick upload response did not contain mediaUrl: {body}')
+    return {'ok':True,'media_url':media_url,'expires_in':body.get('expiresIn'),'filename':filename}
+
 @app.post('/api/templates')
 def save_template(x:TemplateIn,u=Depends(current_user)):
     if x.kind not in ('approved','custom'): raise HTTPException(400,'Template kind must be approved or custom')
@@ -422,7 +456,9 @@ def save_template(x:TemplateIn,u=Depends(current_user)):
     if len(x.content.strip())>1024: raise HTTPException(400,'WhatsApp template body must be 1024 characters or fewer')
     if x.language.strip() not in ('en','hi','en_US','hi_IN'): raise HTTPException(400,'Use a supported language code such as en or hi')
     if x.category.upper() not in ('MARKETING','UTILITY'): raise HTTPException(400,'Category must be MARKETING or UTILITY')
-    c=db(); c.execute('INSERT INTO templates(user_id,name,kind,content,template_name,language,category,approval_status,header_text,footer_text) VALUES(?,?,?,?,?,?,?,?,?,?)',(u['id'],x.name.strip(),x.kind,x.content.strip(),x.template_name.strip(),x.language.strip(),x.category.upper(),'DRAFT',x.header_text.strip(),x.footer_text.strip())); c.commit(); c.close(); return {'ok':True}
+    if x.header_media_url and x.header_text.strip(): raise HTTPException(400,'Use either an image header or a text header, not both.')
+    if x.header_media_url and not x.header_media_url.startswith('https://'): raise HTTPException(400,'Uploaded image URL must be HTTPS.')
+    c=db(); c.execute('INSERT INTO templates(user_id,name,kind,content,template_name,language,category,approval_status,header_text,footer_text,header_media_url) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(u['id'],x.name.strip(),x.kind,x.content.strip(),x.template_name.strip(),x.language.strip(),x.category.upper(),'DRAFT',x.header_text.strip(),x.footer_text.strip(),x.header_media_url.strip())); c.commit(); c.close(); return {'ok':True}
 
 
 def doubletick_headers():
@@ -454,7 +490,8 @@ def submit_template(tid:int,u=Depends(current_user)):
     if row['header_text'] and len(row['header_text'])>60: c.close(); raise HTTPException(400,'Header must be 60 characters or fewer')
     if row['footer_text'] and len(row['footer_text'])>60: c.close(); raise HTTPException(400,'Footer must be 60 characters or fewer')
     components={'body':{'text':row['content']}}
-    if row['header_text']: components['header']={'format':'TEXT','text':row['header_text']}
+    if row['header_media_url']: components['header']={'format':'IMAGE','example':{'link':row['header_media_url']}}
+    elif row['header_text']: components['header']={'format':'TEXT','text':row['header_text']}
     if row['footer_text']: components['footer']={'text':row['footer_text']}
     payload={'name':name,'language':row['language'] or 'en','category':row['category'] or 'MARKETING','allowCategoryUpdate':True,'wabaNumbers':[dt_sender_number()],'components':components}
     try:

@@ -3,3 +3,4 @@ uvicorn[standard]>=0.30,<1
 python-dotenv>=1.0,<2
 requests>=2.31,<3
 psycopg2-binary>=2.9,<3
+python-multipart

@@ -591,80 +591,213 @@ def _find_provider_status(value):
     return '', ''
 
 @app.post('/api/webhooks/doubletick')
-async def doubletick_webhook(request:Request, x_webhook_secret:Optional[str]=Header(None)):
-    """Receive DoubleTick events. Accept the configured secret via query token or header."""
-    expected=os.getenv('DOUBLETICK_WEBHOOK_SECRET','').strip()
+async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] = Header(None)):
+    """Receive DoubleTick webhooks and safely acknowledge unsupported events."""
+    import logging
+    logger = logging.getLogger("uvicorn.error")
+
+    # Authenticate using either the URL query token or the legacy header.
+    expected = os.getenv('DOUBLETICK_WEBHOOK_SECRET', '').strip()
     if not expected:
-        raise HTTPException(503,'DOUBLETICK_WEBHOOK_SECRET is not configured.')
-    # Supports the URL format registered in DoubleTick: /api/webhooks/doubletick?token=...
-    # Also keeps backward compatibility with the x-webhook-secret header.
-    query_token=request.query_params.get('token','').strip()
-    header_token=(x_webhook_secret or '').strip()
-    supplied_token=query_token or header_token
-    if not supplied_token or not hmac.compare_digest(supplied_token,expected):
-        raise HTTPException(401,'Invalid webhook token')
-    try: payload=await request.json()
-    except Exception: raise HTTPException(400,'Webhook body must be valid JSON')
-    if not isinstance(payload,dict): raise HTTPException(400,'Webhook payload must be a JSON object')
-    event=str(payload.get('event') or payload.get('eventType') or '').upper()
-    if event == 'MESSAGE_RECEIVED':
-        msg=payload.get('message') if isinstance(payload.get('message'),dict) else {}
-        phone=re.sub(r'\D','',str(payload.get('from') or payload.get('customerPhone') or ''))
-        if not phone: raise HTTPException(400,'Incoming message is missing sender phone number')
-        contact=payload.get('contact') if isinstance(payload.get('contact'),dict) else {}
-        name=str(contact.get('name') or payload.get('customerName') or phone)[:200]
-        mtype=str(msg.get('type') or 'TEXT').upper()
-        text_value=msg.get('text') or msg.get('caption') or msg.get('body') or ''
-        if isinstance(text_value,dict): text_value=json.dumps(text_value,ensure_ascii=False)
-        media_url=str(msg.get('url') or msg.get('mediaUrl') or '')
-        if not text_value and media_url: text_value=f'[{mtype}]'
-        message_id=str(payload.get('messageId') or payload.get('dtMessageId') or '')
-        c=db()
-        owner=c.execute("SELECT user_id,candidate_name FROM logs WHERE REPLACE(REPLACE(REPLACE(phone,'+',''),' ',''),'-','') LIKE ? ORDER BY id DESC LIMIT 1",('%'+phone[-10:],)).fetchone()
-        uid=owner['user_id'] if owner else None
-        if owner and owner['candidate_name']: name=str(owner['candidate_name'])
-        duplicate=None
-        if message_id: duplicate=c.execute("SELECT id FROM chat_messages WHERE provider_message_id=? AND provider_message_id<>'' LIMIT 1",(message_id,)).fetchone()
-        if not duplicate:
-            c.execute('INSERT INTO chat_messages(user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id) VALUES(?,?,?,?,?,?,?,?)',(uid,phone,name,'IN',mtype,str(text_value)[:5000],media_url,message_id))
-        c.commit(); c.close()
-        return {'ok':True,'event':'MESSAGE_RECEIVED','saved':not bool(duplicate),'assigned':bool(uid)}
+        logger.error("DoubleTick webhook secret is not configured")
+        raise HTTPException(503, 'DOUBLETICK_WEBHOOK_SECRET is not configured.')
 
-    # Template status notifications use TEMPLATE_STATUS_UPDATE as the payload event name.
-    if event in ('TEMPLATE_UPDATE','TEMPLATE_STATUS_UPDATE') or payload.get('newStatus'):
-        name=str(payload.get('templateName') or payload.get('name') or '').strip()
-        language=str(payload.get('templateLanguage') or payload.get('language') or 'en').strip()
-        status=str(payload.get('newStatus') or payload.get('status') or '').strip().upper()
-        if not name or status not in ('APPROVED','REJECTED','PENDING','PAUSED'):
-            raise HTTPException(400,'Template webhook is missing templateName or a valid newStatus')
-        c=db()
-        c.execute('UPDATE templates SET approval_status=?,provider_detail=? WHERE LOWER(template_name)=LOWER(?) AND LOWER(language)=LOWER(?)',
-                  (status,json.dumps(payload,ensure_ascii=False)[:1500],name,language))
-        c.commit(); c.close()
-        return {'ok':True,'event':'TEMPLATE_STATUS_UPDATE','template_name':name,'language':language,'status':status}
+    query_token = request.query_params.get('token', '').strip()
+    header_token = (x_webhook_secret or '').strip()
+    supplied_token = query_token or header_token
+    if not supplied_token or not hmac.compare_digest(supplied_token, expected):
+        logger.warning("DoubleTick webhook authentication failed")
+        raise HTTPException(401, 'Invalid webhook token')
 
-    if event in ('MESSAGE_STATUS_UPDATE','MESSAGE_STATUS',''):
-        message_id=str(payload.get('messageId') or payload.get('dtMessageId') or '').strip()
-        status=str(payload.get('status') or '').strip().upper()
-        if status not in ('SENT','DELIVERED','READ','FAILED'):
-            raise HTTPException(400,'Unsupported or missing message status')
-        recipient=re.sub(r'\D','',str(payload.get('to') or payload.get('recipient') or ''))
-        detail=str(payload.get('failMessage') or payload.get('errorMessage') or f'DoubleTick status update: {status}')[:1500]
-        c=db(); target=None
-        if message_id:
-            target=c.execute('SELECT id,status FROM logs WHERE provider_message_id=? ORDER BY id DESC LIMIT 1',(message_id,)).fetchone()
-        # Compatibility fallback for old proxy responses that did not return a message ID.
-        if not target and recipient:
-            candidates=c.execute("SELECT id,phone,status FROM logs WHERE status IN ('PROCESSING','ENQUEUED','SENT','UNKNOWN') ORDER BY id DESC LIMIT 200").fetchall()
-            for candidate in candidates:
-                digits=re.sub(r'\D','',str(candidate['phone'] or ''))
-                if digits and digits==recipient:
-                    target=candidate; break
-        if target:
-            c.execute('UPDATE logs SET status=?,detail=?,status_updated_at=CURRENT_TIMESTAMP WHERE id=?', (status,detail,target['id']))
-        c.commit(); c.close()
-        return {'ok':True,'event':'MESSAGE_STATUS_UPDATE','matched':bool(target),'status':status,'message_id':message_id}
-    return {'ok':True,'ignored':True,'event':event}
+    # Read raw body once. This also lets us log useful diagnostics for bad payloads.
+    raw_body = await request.body()
+    try:
+        payload = json.loads(raw_body.decode('utf-8-sig'))
+    except Exception as exc:
+        logger.error("DoubleTick webhook invalid JSON: %s; content_type=%s",
+                     str(exc), request.headers.get('content-type', ''))
+        raise HTTPException(400, 'Webhook body must be valid JSON')
+
+    if isinstance(payload, list):
+        if len(payload) == 1 and isinstance(payload[0], dict):
+            payload = payload[0]
+        else:
+            logger.info("DoubleTick webhook acknowledged list payload (%s items)", len(payload))
+            return {'ok': True, 'ignored': True, 'reason': 'Unsupported list payload'}
+    if not isinstance(payload, dict):
+        logger.info("DoubleTick webhook acknowledged non-object JSON payload")
+        return {'ok': True, 'ignored': True, 'reason': 'Payload is not an object'}
+
+    # Providers sometimes wrap the event under data/payload/body.
+    event_data = payload
+    for wrapper_key in ('data', 'payload', 'body'):
+        nested = event_data.get(wrapper_key)
+        if isinstance(nested, dict) and any(
+            k in nested for k in ('event', 'eventType', 'from', 'message', 'newStatus')
+        ):
+            event_data = nested
+            break
+
+    event = str(
+        event_data.get('event') or event_data.get('eventType') or
+        payload.get('event') or payload.get('eventType') or ''
+    ).strip().upper()
+    logger.info("DoubleTick webhook received: event=%s top_keys=%s event_keys=%s",
+                event or 'UNKNOWN', list(payload.keys())[:30], list(event_data.keys())[:30])
+
+    msg = event_data.get('message') if isinstance(event_data.get('message'), dict) else {}
+    is_incoming = event in ('MESSAGE_RECEIVED', 'INCOMING_MESSAGE', 'MESSAGE_IN') or (
+        not event and bool(event_data.get('from') or event_data.get('customerPhone'))
+        and isinstance(event_data.get('message'), dict)
+    )
+
+    # Incoming customer WhatsApp message.
+    if is_incoming:
+        phone_value = (event_data.get('from') or event_data.get('customerPhone') or
+                       event_data.get('phone') or event_data.get('sender') or '')
+        phone_digits = re.sub(r'\D', '', str(phone_value))
+        if not phone_digits:
+            logger.warning("DoubleTick incoming event has no sender phone; keys=%s",
+                           list(event_data.keys())[:30])
+            # Acknowledge instead of making DoubleTick retry a permanently unusable event.
+            return {'ok': True, 'ignored': True, 'reason': 'Sender phone missing'}
+
+        contact = event_data.get('contact') if isinstance(event_data.get('contact'), dict) else {}
+        candidate_name = str(contact.get('name') or event_data.get('customerName') or
+                             event_data.get('name') or phone_digits)[:200]
+        message_type = str(msg.get('type') or event_data.get('messageType') or 'TEXT').upper()
+        text_value = (msg.get('text') or msg.get('caption') or msg.get('body') or
+                      event_data.get('text') or event_data.get('body') or '')
+        if isinstance(text_value, (dict, list)):
+            text_value = json.dumps(text_value, ensure_ascii=False)
+        media_url = str(msg.get('url') or msg.get('mediaUrl') or msg.get('link') or
+                        event_data.get('mediaUrl') or '')
+        if not text_value:
+            text_value = f'[{message_type}]' if media_url else f'[{message_type} message]'
+        message_id = str(event_data.get('dtMessageId') or event_data.get('messageId') or
+                         msg.get('messageId') or '').strip()
+
+        c = db()
+        try:
+            # Phone comparison is normalized to the last 10 digits for Indian numbers.
+            if DATABASE_URL:
+                owner = c.execute(
+                    "SELECT user_id,candidate_name FROM logs "
+                    "WHERE RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? "
+                    "ORDER BY id DESC LIMIT 1", (phone_digits[-10:],)
+                ).fetchone()
+            else:
+                owner = c.execute(
+                    "SELECT user_id,candidate_name FROM logs "
+                    "WHERE substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? "
+                    "ORDER BY id DESC LIMIT 1", (phone_digits[-10:],)
+                ).fetchone()
+
+            user_id = owner['user_id'] if owner else None
+            if owner and owner['candidate_name']:
+                candidate_name = str(owner['candidate_name'])[:200]
+
+            duplicate = None
+            if message_id:
+                duplicate = c.execute(
+                    "SELECT id FROM chat_messages WHERE provider_message_id=? "
+                    "AND provider_message_id<>'' LIMIT 1", (message_id,)
+                ).fetchone()
+
+            if not duplicate:
+                c.execute(
+                    "INSERT INTO chat_messages(user_id,phone,candidate_name,direction,"
+                    "message_type,content,media_url,provider_message_id) VALUES(?,?,?,?,?,?,?,?)",
+                    (user_id, phone_digits, candidate_name, 'IN', message_type,
+                     str(text_value)[:5000], media_url[:2000], message_id)
+                )
+                c.commit()
+
+            logger.info("DoubleTick incoming saved=%s assigned=%s type=%s phone_last4=%s",
+                        not bool(duplicate), bool(user_id), message_type, phone_digits[-4:])
+            return {'ok': True, 'event': 'MESSAGE_RECEIVED',
+                    'saved': not bool(duplicate), 'assigned': bool(user_id)}
+        except Exception:
+            c.rollback()
+            logger.exception("DoubleTick incoming message database processing failed")
+            raise HTTPException(500, 'Could not save incoming WhatsApp message')
+        finally:
+            c.close()
+
+    # Template approval events.
+    if event in ('TEMPLATE_UPDATE', 'TEMPLATE_STATUS_UPDATE') or event_data.get('newStatus'):
+        template_name = str(event_data.get('templateName') or event_data.get('name') or '').strip()
+        language = str(event_data.get('templateLanguage') or event_data.get('language') or 'en').strip()
+        status = str(event_data.get('newStatus') or event_data.get('status') or '').strip().upper()
+        if not template_name or status not in ('APPROVED', 'REJECTED', 'PENDING', 'PAUSED'):
+            logger.info("DoubleTick incomplete template event acknowledged: keys=%s",
+                        list(event_data.keys())[:30])
+            return {'ok': True, 'ignored': True, 'reason': 'Incomplete template status event'}
+        c = db()
+        try:
+            c.execute(
+                "UPDATE templates SET approval_status=?,provider_detail=? "
+                "WHERE LOWER(template_name)=LOWER(?) AND LOWER(language)=LOWER(?)",
+                (status, json.dumps(event_data, ensure_ascii=False)[:1500], template_name, language)
+            )
+            c.commit()
+        finally:
+            c.close()
+        return {'ok': True, 'event': 'TEMPLATE_STATUS_UPDATE',
+                'template_name': template_name, 'language': language, 'status': status}
+
+    # Outbound delivery/read/failure status events.
+    is_status_event = event in ('MESSAGE_STATUS_UPDATE', 'MESSAGE_STATUS',
+                                'MESSAGE_DELIVERED', 'MESSAGE_READ', 'MESSAGE_FAILED')
+    if is_status_event or (not event and (event_data.get('messageId') or event_data.get('dtMessageId'))):
+        message_id = str(event_data.get('dtMessageId') or event_data.get('messageId') or '').strip()
+        status = str(event_data.get('status') or event_data.get('messageStatus') or '').strip().upper()
+        if not status:
+            status = {'MESSAGE_DELIVERED': 'DELIVERED', 'MESSAGE_READ': 'READ',
+                      'MESSAGE_FAILED': 'FAILED'}.get(event, '')
+        if status not in ('SENT', 'DELIVERED', 'READ', 'FAILED'):
+            logger.info("DoubleTick status event acknowledged but ignored: event=%s status=%s",
+                        event, status or 'MISSING')
+            return {'ok': True, 'ignored': True, 'reason': 'Unsupported or missing status'}
+
+        recipient = re.sub(r'\D', '', str(event_data.get('to') or event_data.get('recipient') or ''))
+        detail = str(event_data.get('failMessage') or event_data.get('errorMessage') or
+                     f'DoubleTick status update: {status}')[:1500]
+        c = db()
+        target = None
+        try:
+            if message_id:
+                target = c.execute(
+                    'SELECT id,status FROM logs WHERE provider_message_id=? ORDER BY id DESC LIMIT 1',
+                    (message_id,)
+                ).fetchone()
+            if not target and recipient:
+                candidates = c.execute(
+                    "SELECT id,phone,status FROM logs "
+                    "WHERE status IN ('PROCESSING','ENQUEUED','SENT','UNKNOWN') "
+                    "ORDER BY id DESC LIMIT 200"
+                ).fetchall()
+                for candidate in candidates:
+                    digits = re.sub(r'\D', '', str(candidate['phone'] or ''))
+                    if digits and digits[-10:] == recipient[-10:]:
+                        target = candidate
+                        break
+            if target:
+                c.execute(
+                    'UPDATE logs SET status=?,detail=?,status_updated_at=CURRENT_TIMESTAMP WHERE id=?',
+                    (status, detail, target['id'])
+                )
+                c.commit()
+            logger.info("DoubleTick status processed status=%s matched=%s", status, bool(target))
+        finally:
+            c.close()
+        return {'ok': True, 'event': 'MESSAGE_STATUS_UPDATE', 'matched': bool(target),
+                'status': status, 'message_id': message_id}
+
+    # Do not return 400 for other valid DoubleTick event types. A 200 stops retry storms.
+    logger.info("DoubleTick unsupported event acknowledged: event=%s keys=%s",
+                event or 'UNKNOWN', list(event_data.keys())[:30])
+    return {'ok': True, 'ignored': True, 'event': event or 'UNKNOWN'}
 
 @app.post('/api/send')
 def send(x:SendIn,u=Depends(current_user)):

@@ -1034,6 +1034,133 @@ def send_chat_reply(phone:str, x:ChatReplyIn, u=Depends(current_user)):
     c.commit(); c.close()
     return {'ok':True,'status':'SENT','message_id':provider_id,'provider':body}
 
+@app.get('/api/analytics')
+def analytics(days: int = 30, u=Depends(current_user)):
+    """Daily WhatsApp message analytics in India time (Asia/Kolkata).
+
+    Campaign sends are counted from logs; incoming messages and chat replies
+    are counted from chat_messages. This avoids double-counting campaign sends.
+    HR users only receive their own assigned records; admins receive all records.
+    """
+    from datetime import datetime, timedelta, timezone
+    try:
+        from zoneinfo import ZoneInfo
+        india_tz = ZoneInfo('Asia/Kolkata')
+    except Exception:
+        india_tz = timezone(timedelta(hours=5, minutes=30))
+
+    days = max(1, min(int(days or 30), 90))
+    today = datetime.now(india_tz).date()
+    start_day = today - timedelta(days=days - 1)
+    # Read a little extra to safely cover UTC timestamps at the India-day boundary.
+    cutoff = datetime.combine(start_day, datetime.min.time(), tzinfo=india_tz).astimezone(timezone.utc).replace(tzinfo=None)
+
+    def local_day(value):
+        if value is None:
+            return None
+        try:
+            if isinstance(value, datetime):
+                dt = value
+            else:
+                raw = str(value).strip().replace('Z', '+00:00')
+                dt = datetime.fromisoformat(raw)
+            if dt.tzinfo is None:
+                # Database CURRENT_TIMESTAMP values are stored as UTC-naive.
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(india_tz).date()
+        except Exception:
+            return None
+
+    c = db()
+    if u['role'] == 'admin':
+        log_rows = c.execute(
+            "SELECT l.user_id,l.status,l.created_at,COALESCE(us.username,'Unknown user') username "
+            "FROM logs l LEFT JOIN users us ON us.id=l.user_id WHERE l.created_at>=?",
+            (cutoff.strftime('%Y-%m-%d %H:%M:%S'),)
+        ).fetchall()
+        chat_rows = c.execute(
+            "SELECT user_id,direction,created_at FROM chat_messages WHERE created_at>=?",
+            (cutoff.strftime('%Y-%m-%d %H:%M:%S'),)
+        ).fetchall()
+        users = c.execute("SELECT id,username FROM users WHERE role='hr' ORDER BY username").fetchall()
+    else:
+        log_rows = c.execute(
+            "SELECT l.user_id,l.status,l.created_at,? username FROM logs l WHERE l.user_id=? AND l.created_at>=?",
+            (u['username'], u['id'], cutoff.strftime('%Y-%m-%d %H:%M:%S'))
+        ).fetchall()
+        chat_rows = c.execute(
+            "SELECT user_id,direction,created_at FROM chat_messages WHERE user_id=? AND created_at>=?",
+            (u['id'], cutoff.strftime('%Y-%m-%d %H:%M:%S'))
+        ).fetchall()
+        users = [{'id': u['id'], 'username': u['username']}]
+    c.close()
+
+    daily = {}
+    by_user = {}
+    for offset in range(days):
+        d = start_day + timedelta(days=offset)
+        key = d.isoformat()
+        daily[key] = {'date': key, 'incoming': 0, 'outgoing': 0, 'total': 0, 'failed': 0}
+
+    def add_user(uid, username):
+        key = str(uid) if uid is not None else 'unassigned'
+        if key not in by_user:
+            by_user[key] = {'user_id': uid, 'username': username or ('Unassigned' if uid is None else 'Unknown user'),
+                            'incoming': 0, 'outgoing': 0, 'total': 0, 'failed': 0}
+        return by_user[key]
+
+    # Outbound campaign/template sends are recorded in logs.
+    for row in log_rows:
+        d = local_day(row['created_at'])
+        if d not in (start_day + timedelta(days=i) for i in range(days)):
+            continue
+        key = d.isoformat(); status = str(row['status'] or '').upper()
+        daily[key]['outgoing'] += 1
+        daily[key]['total'] += 1
+        if status in ('FAILED', 'ERROR', 'REJECTED'):
+            daily[key]['failed'] += 1
+        user_stat = add_user(row['user_id'], row['username'])
+        user_stat['outgoing'] += 1; user_stat['total'] += 1
+        if status in ('FAILED', 'ERROR', 'REJECTED'):
+            user_stat['failed'] += 1
+
+    # Incoming webhook messages and one-to-one chat replies live in chat_messages.
+    for row in chat_rows:
+        d = local_day(row['created_at'])
+        if d is None or d < start_day or d > today:
+            continue
+        key = d.isoformat(); direction = str(row['direction'] or '').upper()
+        if direction not in ('IN', 'OUT'):
+            continue
+        bucket = 'incoming' if direction == 'IN' else 'outgoing'
+        daily[key][bucket] += 1; daily[key]['total'] += 1
+        uid = row['user_id']
+        username = next((x['username'] for x in users if str(x['id']) == str(uid)), None) if uid is not None else None
+        user_stat = add_user(uid, username)
+        user_stat[bucket] += 1; user_stat['total'] += 1
+
+    daily_rows = list(daily.values())
+    result = {
+        'days': days,
+        'from': start_day.isoformat(),
+        'to': today.isoformat(),
+        'timezone': 'Asia/Kolkata',
+        'summary': {
+            'incoming': sum(x['incoming'] for x in daily_rows),
+            'outgoing': sum(x['outgoing'] for x in daily_rows),
+            'total': sum(x['total'] for x in daily_rows),
+            'failed': sum(x['failed'] for x in daily_rows),
+        },
+        'daily': daily_rows,
+    }
+    if u['role'] == 'admin':
+        # Keep active HR users visible even if they have not sent messages in this period.
+        for hr in users:
+            add_user(hr['id'], hr['username'])
+        result['users'] = sorted(by_user.values(), key=lambda x: (x['total'], x['username']), reverse=True)
+    return result
+
+
 @app.get('/api/chats')
 def chats(u=Depends(current_user)):
     c=db()

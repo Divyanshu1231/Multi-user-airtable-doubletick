@@ -5,13 +5,55 @@
 <script>
 let token=localStorage.getItem('sc_token')||'', me=null, candidateCache=[], currentOptions={}, historyTimer=null;let activeChatPhone='',activeChatName='',chatRefreshTimer=null;const $=id=>document.getElementById(id);const api=async(path,opts={})=>{let r=await fetch('/api'+path,{...opts,headers:{'Content-Type':'application/json','Authorization':'Bearer '+token,...opts.headers}});let d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.detail||d.error||'Request failed');return d};function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function logout(){localStorage.removeItem('sc_token');location.reload()}async function login(){ $('loginerr').textContent='';try{let d=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('username').value,password:$('password').value})}).then(r=>r.json().then(x=>{if(!r.ok)throw Error(x.detail);return x}));token=d.token;localStorage.setItem('sc_token',token);await boot()}catch(e){$('loginerr').textContent=e.message}}
 async function boot(){try{me=await api('/me');$('login').classList.add('hidden');$('app').classList.remove('hidden');$('who').textContent=me.username+' · '+me.role.toUpperCase();$('adminnav').classList.toggle('hidden',me.role!=='admin');page('dashboard')}catch(e){token='';localStorage.removeItem('sc_token');$('login').classList.remove('hidden')}}function page(p){if(historyTimer){clearInterval(historyTimer);historyTimer=null}document.querySelectorAll('.nav').forEach(x=>x.classList.toggle('active',x.dataset.page===p));({dashboard:dashboard,analytics:analyticsPage,templates:templatesPage,chats:chatsPage,history:historyPage,users:usersPage,settings:settingsPage}[p]||dashboard)().catch(err=>showError(err.message))}function showError(s){$('view').innerHTML='<div class="alert">'+esc(s)+'</div>'}
-async function dashboard(){ $('view').innerHTML=`<div class="heading"><div><h1>Candidate Search</h1><div class="muted">Filter Airtable candidates and send recruitment messages.</div></div><button class="btn secondary" onclick="loadCandidates(true)">↻ Refresh</button></div><div class="card"><div class="grid"><div class="field"><label>Specialization</label><select id="spec" onchange="filterCandidatesLocal()"><option value="">All specializations</option></select></div><div class="field"><label>State</label><select id="state" onchange="filterCandidatesLocal()"><option value="">All states</option></select></div><div class="field"><label>City</label><select id="city" onchange="filterCandidatesLocal()"><option value="">All cities</option></select></div></div><div class="row"><span class="muted" id="candidatecount">Loading candidates…</span><button class="btn secondary" onclick="selectAll(true)">Select all</button><button class="btn secondary" onclick="selectAll(false)">Clear selection</button></div></div><div class="card"><h3>Send to your own Airtable data</h3><div class="muted small" style="margin-bottom:12px">Export a view from Airtable as CSV, upload it here, preview candidates and send an approved WhatsApp template. This upload does not change Airtable records.</div><div class="row"><input id="airtableCsvFile" type="file" accept=".csv,text/csv"><button class="btn secondary" onclick="uploadAirtableCsv()">Upload Airtable CSV</button><span id="csvUploadStatus" class="muted small"></span></div><div id="csvPreviewPanel"></div></div><div class="card"><div class="tablewrap"><table><thead><tr><th><input type="checkbox" onchange="selectAll(this.checked)"></th><th>Candidate</th><th>Specialization</th><th>State</th><th>City</th></tr></thead><tbody id="candidatebody"><tr><td colspan="5">Loading…</td></tr></tbody></table></div><div class="row" style="margin-top:16px"><span id="selectedcount" class="muted">0 selected</span><button class="btn right" onclick="openSend()">Create message & send</button></div></div><div id="sendpanel"></div>`;await loadCandidates()}
+async function dashboard(){ $('view').innerHTML=`<div class="heading"><div><h1>Candidate Search</h1><div class="muted">Filter Airtable candidates and send recruitment messages.</div></div><button class="btn secondary" onclick="loadCandidates(true)">↻ Refresh</button></div><div class="card"><div class="grid"><div class="field"><label>Specialization</label><select id="spec" onchange="filterCandidatesLocal()"><option value="">All specializations</option></select></div><div class="field"><label>State</label><select id="state" onchange="onStateFilterChange()"><option value="">All Indian states / UTs</option></select></div><div class="field"><label>City</label><select id="city" onchange="filterCandidatesLocal()"><option value="">All cities</option></select></div></div><div class="row"><span class="muted" id="candidatecount">Loading candidates…</span><button class="btn secondary" onclick="selectAll(true)">Select all</button><button class="btn secondary" onclick="selectAll(false)">Clear selection</button></div></div><div class="card"><h3>Send to your own Airtable data</h3><div class="muted small" style="margin-bottom:12px">Export a view from Airtable as CSV, upload it here, preview candidates and send an approved WhatsApp template. This upload does not change Airtable records.</div><div class="row"><input id="airtableCsvFile" type="file" accept=".csv,text/csv"><button class="btn secondary" onclick="uploadAirtableCsv()">Upload Airtable CSV</button><span id="csvUploadStatus" class="muted small"></span></div><div id="csvPreviewPanel"></div></div><div class="card"><div class="tablewrap"><table><thead><tr><th><input type="checkbox" onchange="selectAll(this.checked)"></th><th>Candidate</th><th>Specialization</th><th>State</th><th>City</th></tr></thead><tbody id="candidatebody"><tr><td colspan="5">Loading…</td></tr></tbody></table></div><div class="row" style="margin-top:16px"><span id="selectedcount" class="muted">0 selected</span><button class="btn right" onclick="openSend()">Create message & send</button></div></div><div id="sendpanel"></div>`;await loadCandidates()}
 let csvUploadId='',csvCandidateRows=[];
 async function uploadAirtableCsv(){const f=$('airtableCsvFile')?.files?.[0];if(!f)return alert('Please choose an Airtable CSV file first.');const status=$('csvUploadStatus');status.textContent='Uploading and reading CSV…';try{const fd=new FormData();fd.append('file',f);const r=await fetch('/api/csv/upload',{method:'POST',headers:{'Authorization':'Bearer '+token},body:fd});const d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.detail||'CSV upload failed');csvUploadId=d.upload_id;status.textContent=d.total_rows+' rows uploaded';const p=await api('/csv/preview',{method:'POST',body:JSON.stringify({upload_id:csvUploadId})});csvCandidateRows=p.candidates||[];renderCsvPreview(p)}catch(e){status.textContent='';alert(e.message)}}
 function renderCsvPreview(p){const el=$('csvPreviewPanel');if(!el)return;el.innerHTML=`<div class="alert" style="margin-top:12px">${p.sendable} of ${p.total} rows have a valid phone number and no duplicate number. Phone Number is the only required CSV field; other columns are optional.</div><div class="row" style="margin:10px 0"><b>${p.total} CSV records</b><span class="muted small">${p.sendable} eligible</span><button class="btn secondary" onclick="csvSelectAll(true)">Select eligible</button><button class="btn secondary" onclick="csvSelectAll(false)">Clear</button></div><div class="tablewrap"><table><thead><tr><th></th><th>Name</th><th>Phone</th><th>Specialization</th><th>State</th><th>City</th><th>Validation</th></tr></thead><tbody>${p.candidates.map(x=>`<tr><td><input class="csvcheck" type="checkbox" onchange="updateCsvCount()" value="${x.id}" ${x.sendable?'':'disabled'}></td><td>${esc(x.name)}</td><td>${esc(x.phone_display||'—')}</td><td>${esc(x.specialization)}</td><td>${esc(x.state)}</td><td>${esc(x.city)}</td><td>${x.sendable?'<span class="pill">Eligible</span>':esc(!x.phone_valid?'Invalid/missing phone':x.duplicate?'Duplicate':'Not eligible')}</td></tr>`).join('')}</tbody></table></div><div class="row" style="margin-top:12px"><span id="csvSelectedCount" class="muted">0 selected</span><button class="btn right" onclick="openCsvSend()">Create message & send CSV</button></div><div id="csvSendPanel"></div>`;updateCsvCount()}
 function csvSelectAll(v){document.querySelectorAll('.csvcheck:not(:disabled)').forEach(x=>x.checked=v);updateCsvCount()}function csvSelected(){return [...document.querySelectorAll('.csvcheck:checked')].map(x=>x.value)}function updateCsvCount(){if($('csvSelectedCount'))$('csvSelectedCount').textContent=csvSelected().length+' selected'}
 async function openCsvSend(){if(!csvSelected().length)return alert('Select at least one eligible CSV candidate.');try{await api('/templates/refresh-status',{method:'POST'})}catch(e){}const ts=await api('/templates');const approved=ts.filter(t=>t.approval_status==='APPROVED');$('csvSendPanel').innerHTML=`<div class="card"><h3>Send approved WhatsApp template</h3><div class="field"><label>Approved template</label><select id="csvTemplate"><option value="">Choose approved template</option>${approved.map(t=>`<option value="${esc(t.template_name)}" data-lang="${esc(t.language||'en')}">${esc(t.name)} — ${esc(t.template_name)} (${esc(t.language||'en')})</option>`).join('')}</select></div><label style="display:flex;gap:8px;align-items:flex-start;margin:12px 0;font-size:13px"><input id="csvConsentConfirm" type="checkbox" style="margin-top:3px"><span>I confirm that all selected contacts have explicitly agreed to receive WhatsApp messages from our business.</span></label><button class="btn" onclick="sendCsvNow()">Send to ${csvSelected().length} selected CSV candidates</button><div class="muted small" style="margin-top:8px">Phone Number is the only required CSV column. Other fields are optional. Only approved WhatsApp templates can be sent.</div></div>`;$('csvSendPanel').scrollIntoView({behavior:'smooth'})}
 async function sendCsvNow(){const name=$('csvTemplate')?.value;if(!name)return alert('Choose an approved template.');const ids=csvSelected();if(!ids.length)return alert('Select candidates first.');const consent=$('csvConsentConfirm')?.checked;if(!consent)return alert('Please confirm that all selected contacts have explicitly opted in.');if(!confirm(`Send approved template ${name} to ${ids.length} CSV contacts?`))return;try{const opt=$('csvTemplate').selectedOptions[0];const lang=opt?.dataset.lang||'en';const b=$('csvSendPanel').querySelector('button');b.disabled=true;b.textContent='Sending…';const d=await api('/csv/send',{method:'POST',body:JSON.stringify({upload_id:csvUploadId,candidate_ids:ids,template_name:name,language:lang,confirm_opt_in:true})});alert(`CSV campaign completed. Accepted/enqueued: ${d.summary.sent}, Failed: ${d.summary.failed}`);$('csvSendPanel').innerHTML=`<div class="alert success">Completed. Accepted/enqueued: ${d.summary.sent}; Failed: ${d.summary.failed}. See Message History for status updates.</div>`}catch(e){alert(e.message);const b=$('csvSendPanel')?.querySelector('button');if(b){b.disabled=false;b.textContent='Send to selected CSV candidates'}}}
+const INDIA_STATES_UTS = [
+  'Andhra Pradesh','Arunachal Pradesh','Assam','Bihar','Chhattisgarh','Goa','Gujarat',
+  'Haryana','Himachal Pradesh','Jharkhand','Karnataka','Kerala','Madhya Pradesh',
+  'Maharashtra','Manipur','Meghalaya','Mizoram','Nagaland','Odisha','Punjab',
+  'Rajasthan','Sikkim','Tamil Nadu','Telangana','Tripura','Uttar Pradesh',
+  'Uttarakhand','West Bengal',
+  'Andaman and Nicobar Islands','Chandigarh','Dadra and Nagar Haveli and Daman and Diu',
+  'Delhi','Jammu and Kashmir','Ladakh','Lakshadweep','Puducherry'
+];
+const STATE_ALIASES = {
+  'orissa':'Odisha','uttaranchal':'Uttarakhand','pondicherry':'Puducherry',
+  'nct of delhi':'Delhi','new delhi':'Delhi','delhi ncr':'Delhi',
+  'jammu & kashmir':'Jammu and Kashmir','j&k':'Jammu and Kashmir',
+  'andaman & nicobar islands':'Andaman and Nicobar Islands',
+  'andaman nicobar':'Andaman and Nicobar Islands',
+  'dadra and nagar haveli':'Dadra and Nagar Haveli and Daman and Diu',
+  'daman and diu':'Dadra and Nagar Haveli and Daman and Diu',
+  'dadra nagar haveli and daman diu':'Dadra and Nagar Haveli and Daman and Diu'
+};
+function cleanFieldValues(v){if(Array.isArray(v))return v.map(x=>String(x??'').trim()).filter(Boolean);return String(v??'').trim()?[String(v).trim()]:[]}
+function canonicalState(v){const raw=String(v??'').trim();if(!raw)return '';const key=raw.toLocaleLowerCase().replace(/\s+/g,' ').replace(/[.,]$/,'');const alias=STATE_ALIASES[key];if(alias)return alias;return INDIA_STATES_UTS.find(x=>x.toLocaleLowerCase()===key)||''}
+function candidateHasState(c,wanted){const vals=cleanFieldValues(c.state);if(wanted==='__EMPTY__')return vals.length===0||vals.every(v=>!String(v).trim());if(!wanted)return true;return vals.some(v=>canonicalState(v)===wanted)}
+function candidateHasCity(c,wanted){const vals=cleanFieldValues(c.city);if(wanted==='__EMPTY__')return vals.length===0;if(!wanted)return true;return vals.some(v=>v.toLocaleLowerCase()===wanted.toLocaleLowerCase())}
+function renderStateOptions(selected=''){
+ const el=$('state');if(!el)return;
+ el.innerHTML='<option value="">All Indian states / UTs</option>'+INDIA_STATES_UTS.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join('')+'<option value="__EMPTY__">Empty / Not specified</option>';
+ el.value=selected;
+}
+function refreshCityOptions(preserve=true){
+ const el=$('city');if(!el)return;
+ const previous=preserve?el.value:'';
+ const state=$('state')?.value||'';
+ const spec=($('spec')?.value||'').trim().toLocaleLowerCase();
+ const relevant=candidateCache.filter(c=>candidateHasState(c,state)&&(!spec||cleanFieldValues(c.specialization).some(v=>v.toLocaleLowerCase()===spec)));
+ const citySet=new Map();
+ relevant.forEach(c=>cleanFieldValues(c.city).forEach(v=>{const key=v.trim();if(key&&!citySet.has(key.toLocaleLowerCase()))citySet.set(key.toLocaleLowerCase(),key)}));
+ const cities=[...citySet.values()].sort((a,b)=>a.localeCompare(b,undefined,{sensitivity:'base'}));
+ const hasEmpty=relevant.some(c=>cleanFieldValues(c.city).length===0);
+ el.innerHTML='<option value="">All cities</option>'+cities.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join('')+(hasEmpty?'<option value="__EMPTY__">Empty / Not specified</option>':'');
+ if(previous && [...el.options].some(o=>o.value===previous))el.value=previous;else el.value='';
+}
+function onStateFilterChange(){refreshCityOptions(false);filterCandidatesLocal()}
 async function loadCandidates(forceRefresh=false){
   const count=$('candidatecount'), body=$('candidatebody');
   if(count)count.textContent=forceRefresh?'Refreshing Airtable candidates…':'Loading candidates…';
@@ -19,11 +61,9 @@ async function loadCandidates(forceRefresh=false){
   try{
     const d=await api('/candidates'+(forceRefresh?'?refresh=true':''));
     candidateCache=d.candidates||[]; currentOptions=d.options||{};
-    [['spec','specializations','All specializations'],['state','states','All states'],['city','cities','All cities']].forEach(([id,key,label])=>{
-      const el=$(id); if(!el)return; const previous=el.value; const vals=currentOptions[key]||[];
-      el.innerHTML='<option value="">'+label+'</option>'+vals.map(v=>'<option value="'+esc(v)+'">'+esc(v)+'</option>').join('');
-      if(vals.includes(previous))el.value=previous;
-    });
+    const specEl=$('spec');if(specEl){const previous=specEl.value;const vals=currentOptions.specializations||[];specEl.innerHTML='<option value="">All specializations</option>'+vals.map(v=>'<option value="'+esc(v)+'">'+esc(v)+'</option>').join('');if(vals.includes(previous))specEl.value=previous;}
+    const statePrevious=$('state')?.value||'';renderStateOptions(statePrevious);
+    refreshCityOptions(true);
     filterCandidatesLocal();
   }catch(e){
     if(count)count.textContent='Could not load candidates';
@@ -32,14 +72,20 @@ async function loadCandidates(forceRefresh=false){
 }
 function filterCandidatesLocal(){
   const spec=($('spec')?.value||'').trim().toLocaleLowerCase();
-  const state=($('state')?.value||'').trim().toLocaleLowerCase();
-  const city=($('city')?.value||'').trim().toLocaleLowerCase();
+  const state=$('state')?.value||'';
+  // Specialization changes can also change the available city list.
+  if($('city')){
+    const current=$('city').value;
+    refreshCityOptions(true);
+    if(current && $('city').value!==current) $('city').value='';
+  }
+  const city=$('city')?.value||'';
   const filtered=candidateCache.filter(c=>{
-    const has=(arr,want)=>!want||(arr||[]).some(v=>String(v).trim().toLocaleLowerCase()===want);
-    return has(c.specialization,spec)&&has(c.state,state)&&has(c.city,city);
+    const specs=cleanFieldValues(c.specialization);
+    return (!spec||specs.some(v=>v.toLocaleLowerCase()===spec))&&candidateHasState(c,state)&&candidateHasCity(c,city);
   });
   $('candidatecount').textContent=filtered.length+' candidates found';
-  $('candidatebody').innerHTML=filtered.map(c=>`<tr><td><input class="candidatecheck" type="checkbox" value="${esc(c.id)}" onchange="updateSelected()"></td><td><b>${esc(c.name||'Unnamed')}</b></td><td>${esc((c.specialization||[]).join(', '))}</td><td>${esc((c.state||[]).join(', '))}</td><td>${esc((c.city||[]).join(', '))}</td></tr>`).join('')||'<tr><td colspan="5" class="muted">No matching candidates for the selected filters.</td></tr>';
+  $('candidatebody').innerHTML=filtered.map(c=>`<tr><td><input class="candidatecheck" type="checkbox" value="${esc(c.id)}" onchange="updateSelected()"></td><td><b>${esc(c.name||'Unnamed')}</b></td><td>${esc(cleanFieldValues(c.specialization).join(', ')||'—')}</td><td>${esc(cleanFieldValues(c.state).map(v=>canonicalState(v)||v).join(', ')||'—')}</td><td>${esc(cleanFieldValues(c.city).join(', ')||'—')}</td></tr>`).join('')||'<tr><td colspan="5" class="muted">No matching candidates for the selected filters.</td></tr>';
   updateSelected();
 }
 function selectAll(v){document.querySelectorAll('.candidatecheck').forEach(x=>x.checked=v);updateSelected()}function selected(){return [...document.querySelectorAll('.candidatecheck:checked')].map(x=>x.value)}function updateSelected(){if($('selectedcount'))$('selectedcount').textContent=selected().length+' selected'}

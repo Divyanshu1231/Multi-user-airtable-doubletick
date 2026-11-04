@@ -1,7 +1,8 @@
-import os, re, json, hmac, hashlib, secrets, sqlite3, time, requests, threading, copy, uuid, csv, io
+import os, re, json, hmac, hashlib, secrets, sqlite3, time, requests, threading, copy
 from pathlib import Path
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Depends, Header, Request, UploadFile, File, Form
+import csv, io
+from fastapi import FastAPI, HTTPException, Depends, Header, Request, UploadFile, File
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -61,11 +62,9 @@ def db():
         c.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         c.execute("CREATE TABLE IF NOT EXISTS templates(id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL, template_name TEXT DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         existing={r['name'] for r in c.execute("SELECT column_name AS name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='templates'").fetchall()}
-        for col,ddl in {'language':"TEXT DEFAULT 'en'",'category':"TEXT DEFAULT 'MARKETING'",'approval_status':"TEXT DEFAULT 'DRAFT'",'header_text':"TEXT DEFAULT ''",'footer_text':"TEXT DEFAULT ''",'provider_detail':"TEXT DEFAULT ''",'submitted_at':"TEXT DEFAULT ''",'header_media_url':"TEXT DEFAULT ''"}.items():
+        for col,ddl in {'language':"TEXT DEFAULT 'en'",'category':"TEXT DEFAULT 'MARKETING'",'approval_status':"TEXT DEFAULT 'DRAFT'",'header_text':"TEXT DEFAULT ''",'footer_text':"TEXT DEFAULT ''",'provider_detail':"TEXT DEFAULT ''",'submitted_at':"TEXT DEFAULT ''"}.items():
             if col not in existing: c.execute(f'ALTER TABLE templates ADD COLUMN {col} {ddl}')
-        c.execute("CREATE TABLE IF NOT EXISTS chat_messages(id BIGSERIAL PRIMARY KEY, user_id BIGINT, phone TEXT NOT NULL, candidate_name TEXT DEFAULT '', direction TEXT NOT NULL, message_type TEXT DEFAULT 'TEXT', content TEXT DEFAULT '', media_url TEXT DEFAULT '', provider_message_id TEXT DEFAULT '', status TEXT DEFAULT 'RECEIVED', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-        chat_cols={r['name'] for r in c.execute("SELECT column_name AS name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='chat_messages'").fetchall()}
-        if 'status' not in chat_cols: c.execute("ALTER TABLE chat_messages ADD COLUMN status TEXT DEFAULT 'RECEIVED'")
+        c.execute("CREATE TABLE IF NOT EXISTS chat_messages(id BIGSERIAL PRIMARY KEY, user_id BIGINT, phone TEXT NOT NULL, candidate_name TEXT DEFAULT '', direction TEXT NOT NULL, message_type TEXT DEFAULT 'TEXT', content TEXT DEFAULT '', media_url TEXT DEFAULT '', provider_message_id TEXT DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         c.execute("CREATE TABLE IF NOT EXISTS logs(id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, candidate_name TEXT, phone TEXT, kind TEXT, template_name TEXT, status TEXT, detail TEXT, provider_message_id TEXT DEFAULT '', status_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         log_cols={r['name'] for r in c.execute("SELECT column_name AS name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='logs'").fetchall()}
         for col,ddl in {'provider_message_id':"TEXT DEFAULT ''",'status_updated_at':"TIMESTAMP DEFAULT CURRENT_TIMESTAMP"}.items():
@@ -76,11 +75,9 @@ def db():
     c.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     c.execute("CREATE TABLE IF NOT EXISTS templates(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL, template_name TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
     existing={r['name'] for r in c.execute('PRAGMA table_info(templates)').fetchall()}
-    for col,ddl in {'language':"TEXT DEFAULT 'en'",'category':"TEXT DEFAULT 'MARKETING'",'approval_status':"TEXT DEFAULT 'DRAFT'",'header_text':"TEXT DEFAULT ''",'footer_text':"TEXT DEFAULT ''",'provider_detail':"TEXT DEFAULT ''",'submitted_at':"TEXT DEFAULT ''",'header_media_url':"TEXT DEFAULT ''"}.items():
+    for col,ddl in {'language':"TEXT DEFAULT 'en'",'category':"TEXT DEFAULT 'MARKETING'",'approval_status':"TEXT DEFAULT 'DRAFT'",'header_text':"TEXT DEFAULT ''",'footer_text':"TEXT DEFAULT ''",'provider_detail':"TEXT DEFAULT ''",'submitted_at':"TEXT DEFAULT ''"}.items():
         if col not in existing: c.execute(f'ALTER TABLE templates ADD COLUMN {col} {ddl}')
-    c.execute("CREATE TABLE IF NOT EXISTS chat_messages(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, phone TEXT NOT NULL, candidate_name TEXT DEFAULT '', direction TEXT NOT NULL, message_type TEXT DEFAULT 'TEXT', content TEXT DEFAULT '', media_url TEXT DEFAULT '', provider_message_id TEXT DEFAULT '', status TEXT DEFAULT 'RECEIVED', created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
-    chat_cols={r['name'] for r in c.execute('PRAGMA table_info(chat_messages)').fetchall()}
-    if 'status' not in chat_cols: c.execute("ALTER TABLE chat_messages ADD COLUMN status TEXT DEFAULT 'RECEIVED'")
+    c.execute("CREATE TABLE IF NOT EXISTS chat_messages(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, phone TEXT NOT NULL, candidate_name TEXT DEFAULT '', direction TEXT NOT NULL, message_type TEXT DEFAULT 'TEXT', content TEXT DEFAULT '', media_url TEXT DEFAULT '', provider_message_id TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
     c.execute("CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, candidate_name TEXT, phone TEXT, kind TEXT, template_name TEXT, status TEXT, detail TEXT, provider_message_id TEXT DEFAULT '', status_updated_at TEXT DEFAULT CURRENT_TIMESTAMP, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
     existing_logs={r['name'] for r in c.execute('PRAGMA table_info(logs)').fetchall()}
     for col,ddl in {'provider_message_id':"TEXT DEFAULT ''",'status_updated_at':"TEXT DEFAULT CURRENT_TIMESTAMP"}.items():
@@ -183,9 +180,10 @@ class UserUpdate(BaseModel): password:Optional[str]=None; active:Optional[bool]=
 class AirtableConfig(BaseModel): urls:list[str]=[]; max_messages_per_user_per_day:int=50
 class TemplateIn(BaseModel):
     name:str; kind:str='custom'; content:str; template_name:str=''
-    language:str='en'; category:str='MARKETING'; header_text:str=''; footer_text:str=''; header_media_url:str=''; header_format:str='TEXT'
+    language:str='en'; category:str='MARKETING'; header_text:str=''; footer_text:str=''
 class SendIn(BaseModel): candidate_ids:list[str]; kind:str; template_name:str=''; message:str=''; language:str='en'
-class ChatReplyIn(BaseModel): message:str=Field(min_length=1,max_length=4000)
+class CsvPreviewIn(BaseModel): upload_id:str
+class CsvSendIn(BaseModel): upload_id:str; candidate_ids:list[str]; template_name:str; language:str='en'
 
 @app.on_event('startup')
 def startup():
@@ -306,35 +304,117 @@ def candidates(
         'candidates': safe_candidates,
         'total_candidates': len(safe_candidates),
     }
+
+# Temporary per-process CSV uploads. Files are kept in memory and never written to disk.
+_csv_uploads = {}
+_csv_upload_lock = threading.Lock()
+
+def _csv_norm(v): return re.sub(r'[^a-z0-9]+','',str(v or '').lower())
+def _csv_field(row, aliases):
+    lookup={_csv_norm(k):v for k,v in row.items()}
+    for a in aliases:
+        if _csv_norm(a) in lookup and str(lookup[_csv_norm(a)] or '').strip(): return lookup[_csv_norm(a)]
+    for k,v in row.items():
+        nk=_csv_norm(k)
+        if any(_csv_norm(a) in nk for a in aliases) and str(v or '').strip(): return v
+    return ''
+def _csv_candidate(row):
+    from matcher import phone
+    name=_csv_field(row,['Candidate Name','Name of Candidates','Full Name','Name','Candidate'])
+    mobile=_csv_field(row,['WhatsApp Number','Mobile Number','Mobile No','Phone Number','Phone','Mobile','Contact Number','Contact'])
+    spec=_csv_field(row,['Specialization','Specialisation','Specialty','Speciality','Department'])
+    state=_csv_field(row,['State','Location State','Candidate State','Preferred State'])
+    city=_csv_field(row,['City','Location City','Preferred City'])
+    consent=_csv_field(row,['WhatsApp Opt-In','WhatsApp Opt In','Opt In','Consent','WhatsApp Consent'])
+    yes=str(consent).strip().lower() in ('yes','true','1','checked','opted in','opt-in')
+    return {'name':str(name or '').strip(),'phone':phone(mobile),'specialization':str(spec or '').strip(),'state':str(state or '').strip(),'city':str(city or '').strip(),'opt_in':yes,'_raw':row}
+
+@app.post('/api/csv/upload')
+async def upload_candidate_csv(file: UploadFile=File(...), u=Depends(current_user)):
+    if not file.filename.lower().endswith('.csv'): raise HTTPException(400,'Please upload a .csv file exported from Airtable.')
+    raw=await file.read(5*1024*1024+1)
+    if len(raw)>5*1024*1024: raise HTTPException(413,'CSV file must be 5 MB or smaller.')
+    try:
+        text=raw.decode('utf-8-sig')
+        reader=csv.DictReader(io.StringIO(text))
+        headers=reader.fieldnames or []
+        rows=list(reader)
+    except Exception as exc: raise HTTPException(400,'Could not read CSV: '+str(exc))
+    if not headers or not rows: raise HTTPException(400,'CSV has no header or candidate records.')
+    if len(rows)>2000: raise HTTPException(400,'Maximum 2,000 rows per CSV upload.')
+    upload_id=secrets.token_urlsafe(18)
+    with _csv_upload_lock:
+        _csv_uploads[upload_id]={'user_id':u['id'],'rows':rows,'created':time.time()}
+        for key in list(_csv_uploads):
+            if time.time()-_csv_uploads[key]['created']>1800: _csv_uploads.pop(key,None)
+    preview=[_csv_candidate(r) for r in rows[:8]]
+    return {'upload_id':upload_id,'headers':headers,'total_rows':len(rows),'preview':[{'name':x['name'],'phone_present':bool(x['phone']),'specialization':x['specialization'],'state':x['state'],'city':x['city'],'opt_in':x['opt_in']} for x in preview]}
+
+@app.post('/api/csv/preview')
+def preview_candidate_csv(x:CsvPreviewIn,u=Depends(current_user)):
+    item=_csv_uploads.get(x.upload_id)
+    if not item or item['user_id']!=u['id']: raise HTTPException(404,'CSV upload expired. Please upload it again.')
+    candidates=[_csv_candidate(r) for r in item['rows']]
+    seen=set(); result=[]
+    for i,cand in enumerate(candidates):
+        digits=re.sub(r'\D','',cand['phone'])
+        duplicate=digits in seen if digits else False
+        if digits: seen.add(digits)
+        result.append({'id':str(i),'name':cand['name'] or 'Unnamed candidate','specialization':cand['specialization'],'state':cand['state'],'city':cand['city'],'phone_valid':len(digits)>=12,'opt_in':cand['opt_in'],'duplicate':duplicate,'sendable':bool(cand['phone']) and len(digits)>=12 and cand['opt_in'] and not duplicate})
+    item['candidates']=candidates
+    return {'total':len(result),'sendable':sum(1 for x in result if x['sendable']),'candidates':result}
+
+@app.post('/api/csv/send')
+def send_candidate_csv(x:CsvSendIn,u=Depends(current_user)):
+    item=_csv_uploads.get(x.upload_id)
+    if not item or item['user_id']!=u['id']: raise HTTPException(404,'CSV upload expired. Please upload it again.')
+    if not x.candidate_ids: raise HTTPException(400,'Select at least one eligible CSV candidate.')
+    if not x.template_name.strip(): raise HTTPException(400,'Approved DoubleTick template name is required.')
+    from matcher import send_doubletick_candidate_message
+    rows=item.get('candidates') or [_csv_candidate(r) for r in item['rows']]
+    wanted=set(x.candidate_ids); chosen=[]
+    for i,cand in enumerate(rows):
+        digits=re.sub(r'\D','',cand['phone'])
+        if str(i) in wanted:
+            if not cand['opt_in']: raise HTTPException(400,'WhatsApp consent is required. Only candidates with an explicit opt-in value can be messaged.')
+            if not cand['phone'] or len(digits)<12: raise HTTPException(400,'Selected CSV contains an invalid phone number.')
+            chosen.append((i,cand))
+    if len(chosen)!=len(wanted): raise HTTPException(400,'Some selected CSV rows are invalid. Preview the CSV again.')
+    c=db()
+    try:
+        approved=c.execute("SELECT id FROM templates WHERE user_id=? AND template_name=? AND approval_status='APPROVED'",(u['id'],x.template_name.strip())).fetchone()
+        if not approved: raise HTTPException(400,'Choose a template that is approved and saved under your account.')
+        # Reject duplicate phone numbers even if a client manually submits disabled rows.
+        seen_numbers=set()
+        for _,candidate in chosen:
+            digits=re.sub(r'\D','',candidate['phone'])
+            if digits in seen_numbers: raise HTTPException(400,'Duplicate phone numbers are not allowed in one CSV campaign.')
+            seen_numbers.add(digits)
+        limit=int(get_setting('max_messages_per_user_per_day','50'))
+        if u['role']!='admin':
+            used=c.execute("SELECT COUNT(*) n FROM logs WHERE user_id=? AND date(created_at,'+5 hours','+30 minutes')=date('now','+5 hours','+30 minutes')",(u['id'],)).fetchone()['n']
+            remaining=max(0,limit-used)
+            if len(chosen)>remaining: raise HTTPException(429,f'Daily WhatsApp limit reached. You can attempt {remaining} more message(s) today.')
+        results=[]
+        for i,cand in chosen:
+            status='FAILED'; detail=''; provider_id=''
+            # Construct the same candidate shape expected by matcher.py.
+            payload={'Name':cand['name'],'Mobile Number':cand['phone'],'Specialization':cand['specialization'],'State':cand['state'],'City':cand['city']}
+            try:
+                response=send_doubletick_candidate_message(payload,x.template_name.strip(),x.language.strip() or 'en')
+                provider_id=_find_provider_message_id(response); provider_status,provider_error=_find_provider_status(response)
+                status=provider_status if provider_status in ('SENT','DELIVERED','READ','ENQUEUED') else 'ENQUEUED'
+                if provider_status=='FAILED': status='FAILED'; detail=provider_error or json.dumps(response,ensure_ascii=False)[:1500]
+                else: detail=json.dumps(response,ensure_ascii=False)[:1500]
+            except Exception as exc: detail=str(exc)[:1500]
+            c.execute("INSERT INTO logs(user_id,candidate_name,phone,kind,template_name,status,detail,provider_message_id,status_updated_at) VALUES(?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",(u['id'],cand['name'],cand['phone'],'csv','CSV: '+x.template_name.strip(),status,detail,provider_id))
+            c.commit(); results.append({'name':cand['name'],'status':status,'detail':detail})
+        return {'ok':True,'summary':{'total':len(results),'sent':sum(z['status'] in ('SENT','DELIVERED','READ','ENQUEUED') for z in results),'failed':sum(z['status']=='FAILED' for z in results)},'results':results}
+    finally: c.close()
+
 @app.get('/api/templates')
 def templates(u=Depends(current_user)):
     c=db(); rows=c.execute('SELECT * FROM templates WHERE user_id=? ORDER BY id DESC',(u['id'],)).fetchall(); c.close(); return [dict(r) for r in rows]
-
-@app.post('/api/templates/upload-image')
-async def upload_template_image(file:UploadFile=File(...), u=Depends(current_user)):
-    """Upload an image sample to DoubleTick for an IMAGE template header."""
-    filename=(file.filename or 'template-image').strip()
-    if not os.getenv('DOUBLETICK_API_KEY','').strip(): raise HTTPException(503,'DOUBLETICK_API_KEY is not configured on the backend.')
-    content_type=(file.content_type or '').lower()
-    if content_type not in ('image/jpeg','image/png') and not filename.lower().endswith(('.jpg','.jpeg','.png')):
-        raise HTTPException(400,'Please upload a JPG or PNG image.')
-    data=await file.read(5*1024*1024+1)
-    if not data: raise HTTPException(400,'Selected image is empty.')
-    if len(data)>5*1024*1024: raise HTTPException(413,'Image must be 5 MB or smaller.')
-    if content_type not in ('image/jpeg','image/png'):
-        content_type='image/png' if filename.lower().endswith('.png') else 'image/jpeg'
-    try:
-        resp=requests.post('https://public.doubletick.io/media/upload',
-            headers={'Authorization':os.getenv('DOUBLETICK_API_KEY','').strip(),'Accept':'application/json'},
-            files={'file':(filename,data,content_type)}, timeout=45)
-    except requests.RequestException as exc:
-        raise HTTPException(502,'DoubleTick media upload connection failed: '+str(exc))
-    try: body=resp.json()
-    except Exception: body={'raw':resp.text[:1000]}
-    if not resp.ok: raise HTTPException(resp.status_code,f'DoubleTick media upload failed: {body}')
-    media_url=body.get('mediaUrl') or body.get('url')
-    if not media_url: raise HTTPException(502,f'DoubleTick upload response did not contain mediaUrl: {body}')
-    return {'ok':True,'media_url':media_url,'expires_in':body.get('expiresIn'),'filename':filename}
 
 @app.post('/api/templates')
 def save_template(x:TemplateIn,u=Depends(current_user)):
@@ -343,9 +423,7 @@ def save_template(x:TemplateIn,u=Depends(current_user)):
     if len(x.content.strip())>1024: raise HTTPException(400,'WhatsApp template body must be 1024 characters or fewer')
     if x.language.strip() not in ('en','hi','en_US','hi_IN'): raise HTTPException(400,'Use a supported language code such as en or hi')
     if x.category.upper() not in ('MARKETING','UTILITY'): raise HTTPException(400,'Category must be MARKETING or UTILITY')
-    if x.header_media_url and x.header_text.strip(): raise HTTPException(400,'Use either an image header or a text header, not both.')
-    if x.header_media_url and not x.header_media_url.startswith('https://'): raise HTTPException(400,'Uploaded image URL must be HTTPS.')
-    c=db(); c.execute('INSERT INTO templates(user_id,name,kind,content,template_name,language,category,approval_status,header_text,footer_text,header_media_url) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(u['id'],x.name.strip(),x.kind,x.content.strip(),x.template_name.strip(),x.language.strip(),x.category.upper(),'DRAFT',x.header_text.strip(),x.footer_text.strip(),x.header_media_url.strip())); c.commit(); c.close(); return {'ok':True}
+    c=db(); c.execute('INSERT INTO templates(user_id,name,kind,content,template_name,language,category,approval_status,header_text,footer_text) VALUES(?,?,?,?,?,?,?,?,?,?)',(u['id'],x.name.strip(),x.kind,x.content.strip(),x.template_name.strip(),x.language.strip(),x.category.upper(),'DRAFT',x.header_text.strip(),x.footer_text.strip())); c.commit(); c.close(); return {'ok':True}
 
 
 def doubletick_headers():
@@ -377,10 +455,7 @@ def submit_template(tid:int,u=Depends(current_user)):
     if row['header_text'] and len(row['header_text'])>60: c.close(); raise HTTPException(400,'Header must be 60 characters or fewer')
     if row['footer_text'] and len(row['footer_text'])>60: c.close(); raise HTTPException(400,'Footer must be 60 characters or fewer')
     components={'body':{'text':row['content']}}
-    if row['header_media_url']:
-        components['header']={'format':'IMAGE','example':{'link':row['header_media_url']}}
-    elif row['header_text']:
-        components['header']={'format':'TEXT','text':row['header_text']}
+    if row['header_text']: components['header']={'format':'TEXT','text':row['header_text']}
     if row['footer_text']: components['footer']={'text':row['footer_text']}
     payload={'name':name,'language':row['language'] or 'en','category':row['category'] or 'MARKETING','allowCategoryUpdate':True,'wabaNumbers':[dt_sender_number()],'components':components}
     try:
@@ -480,57 +555,38 @@ def _find_provider_status(value):
 
 @app.post('/api/webhooks/doubletick')
 async def doubletick_webhook(request:Request, x_webhook_secret:Optional[str]=Header(None)):
-    """Receive DoubleTick events.
-
-    Supports either the X-Webhook-Secret header (when the provider supports
-    custom headers) or a URL query token (?token=...) for webhook dashboards
-    that only expose a URL field.
-    """
+    """Receive DoubleTick TEMPLATE_UPDATE and MESSAGE_STATUS_UPDATE events."""
     expected=os.getenv('DOUBLETICK_WEBHOOK_SECRET','').strip()
     if not expected:
         raise HTTPException(503,'DOUBLETICK_WEBHOOK_SECRET is not configured.')
-    supplied=(x_webhook_secret or request.query_params.get('token') or request.query_params.get('secret') or '').strip()
-    if not supplied or not hmac.compare_digest(supplied,expected):
+    if not x_webhook_secret or not hmac.compare_digest(x_webhook_secret,expected):
         raise HTTPException(401,'Invalid webhook secret')
     try: payload=await request.json()
     except Exception: raise HTTPException(400,'Webhook body must be valid JSON')
     if not isinstance(payload,dict): raise HTTPException(400,'Webhook payload must be a JSON object')
-    event=str(payload.get('event') or payload.get('eventType') or payload.get('type') or '').upper()
-    # DoubleTick's documented sample body omits an explicit event field;
-    # infer the event from its distinctive payload shape when necessary.
-    if not event and isinstance(payload.get('message'),dict) and payload.get('from') and payload.get('to'):
-        event='MESSAGE_RECEIVED'
-    if not event and payload.get('status') and payload.get('to'):
-        event='MESSAGE_STATUS_UPDATE'
+    event=str(payload.get('event') or payload.get('eventType') or '').upper()
     if event == 'MESSAGE_RECEIVED':
-        data=payload.get('data') if isinstance(payload.get('data'),dict) else payload.get('payload') if isinstance(payload.get('payload'),dict) else payload
-        msg=data.get('message') if isinstance(data.get('message'),dict) else {}
-        phone=re.sub(r'\D','',str(data.get('from') or data.get('customerPhone') or data.get('sender') or ''))
+        msg=payload.get('message') if isinstance(payload.get('message'),dict) else {}
+        phone=re.sub(r'\D','',str(payload.get('from') or payload.get('customerPhone') or ''))
         if not phone: raise HTTPException(400,'Incoming message is missing sender phone number')
-        contact=data.get('contact') if isinstance(data.get('contact'),dict) else {}
-        name=str(contact.get('name') or data.get('customerName') or data.get('name') or phone)[:200]
-        mtype=str(msg.get('type') or data.get('messageType') or 'TEXT').upper()
-        text_value=msg.get('text') or msg.get('caption') or msg.get('body') or msg.get('title') or ''
-        if isinstance(text_value,(dict,list)): text_value=json.dumps(text_value,ensure_ascii=False)
-        media_url=str(msg.get('url') or msg.get('mediaUrl') or msg.get('media_url') or '')
+        contact=payload.get('contact') if isinstance(payload.get('contact'),dict) else {}
+        name=str(contact.get('name') or payload.get('customerName') or phone)[:200]
+        mtype=str(msg.get('type') or 'TEXT').upper()
+        text_value=msg.get('text') or msg.get('caption') or msg.get('body') or ''
+        if isinstance(text_value,dict): text_value=json.dumps(text_value,ensure_ascii=False)
+        media_url=str(msg.get('url') or msg.get('mediaUrl') or '')
         if not text_value and media_url: text_value=f'[{mtype}]'
-        if not text_value: text_value=json.dumps(msg or data,ensure_ascii=False)[:4000]
-        message_id=str(data.get('dtMessageId') or data.get('messageId') or '')
+        message_id=str(payload.get('messageId') or payload.get('dtMessageId') or '')
         c=db()
-        if DATABASE_URL:
-            owner=c.execute("SELECT user_id,candidate_name,phone FROM logs WHERE RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? ORDER BY id DESC LIMIT 1",(phone[-10:],)).fetchone()
-        else:
-            owner=c.execute("SELECT user_id,candidate_name,phone FROM logs WHERE substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? ORDER BY id DESC LIMIT 1",(phone[-10:],)).fetchone()
+        owner=c.execute("SELECT user_id,candidate_name FROM logs WHERE REPLACE(REPLACE(REPLACE(phone,'+',''),' ',''),'-','') LIKE ? ORDER BY id DESC LIMIT 1",('%'+phone[-10:],)).fetchone()
         uid=owner['user_id'] if owner else None
-        canonical=re.sub(r'\D','',str(owner['phone'] or '')) if owner and owner['phone'] else phone
         if owner and owner['candidate_name']: name=str(owner['candidate_name'])
         duplicate=None
         if message_id: duplicate=c.execute("SELECT id FROM chat_messages WHERE provider_message_id=? AND provider_message_id<>'' LIMIT 1",(message_id,)).fetchone()
         if not duplicate:
-            c.execute('INSERT INTO chat_messages(user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id,status) VALUES(?,?,?,?,?,?,?,?,?)',
-                      (uid,canonical,name,'IN',mtype,str(text_value)[:5000],media_url,message_id,'RECEIVED'))
+            c.execute('INSERT INTO chat_messages(user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id) VALUES(?,?,?,?,?,?,?,?)',(uid,phone,name,'IN',mtype,str(text_value)[:5000],media_url,message_id))
         c.commit(); c.close()
-        return {'ok':True,'event':'MESSAGE_RECEIVED','saved':not bool(duplicate),'assigned':bool(uid),'matched_phone':bool(owner)}
+        return {'ok':True,'event':'MESSAGE_RECEIVED','saved':not bool(duplicate),'assigned':bool(uid)}
 
     # Template status notifications use TEMPLATE_STATUS_UPDATE as the payload event name.
     if event in ('TEMPLATE_UPDATE','TEMPLATE_STATUS_UPDATE') or payload.get('newStatus'):
@@ -564,7 +620,6 @@ async def doubletick_webhook(request:Request, x_webhook_secret:Optional[str]=Hea
                     target=candidate; break
         if target:
             c.execute('UPDATE logs SET status=?,detail=?,status_updated_at=CURRENT_TIMESTAMP WHERE id=?', (status,detail,target['id']))
-        if message_id: c.execute('UPDATE chat_messages SET status=? WHERE provider_message_id=?',(status,message_id))
         c.commit(); c.close()
         return {'ok':True,'event':'MESSAGE_STATUS_UPDATE','matched':bool(target),'status':status,'message_id':message_id}
     return {'ok':True,'ignored':True,'event':event}
@@ -613,9 +668,7 @@ def send(x:SendIn,u=Depends(current_user)):
     for r,log_id in zip(found,ids):
         f=candidate_fields(r); status='FAILED'; detail=''; provider_id=''
         try:
-            template_row=c.execute("SELECT header_media_url FROM templates WHERE user_id=? AND LOWER(template_name)=LOWER(?) AND approval_status='APPROVED' ORDER BY id DESC LIMIT 1",(u['id'],x.template_name.strip())).fetchone()
-            media_url=template_row['header_media_url'] if template_row else ''
-            response=send_doubletick_candidate_message(r,x.template_name.strip(),x.language.strip() or 'en',header_media_url=media_url)
+            response=send_doubletick_candidate_message(r,x.template_name.strip(),x.language.strip() or 'en')
             provider_id=_find_provider_message_id(response)
             provider_status,provider_error=_find_provider_status(response)
             if provider_status=='FAILED':
@@ -639,180 +692,6 @@ def send(x:SendIn,u=Depends(current_user)):
         results.append({'name':str(f.get('name') or ''),'status':current_status if current_status in final_states else status,'detail':detail,'message_id':provider_id})
     c.close()
     return {'ok':True,'summary':{'total':len(results),'sent':sum(z['status'] in ('SENT','DELIVERED','READ','ENQUEUED') for z in results),'failed':sum(z['status']=='FAILED' for z in results),'enqueued':sum(z['status']=='ENQUEUED' for z in results)},'results':results}
-
-def _read_csv_upload(data:bytes):
-    if len(data)>5*1024*1024: raise HTTPException(413,'CSV file must be 5 MB or smaller.')
-    try: text=data.decode('utf-8-sig')
-    except UnicodeDecodeError: raise HTTPException(400,'CSV must be UTF-8 encoded. Export CSV as UTF-8 from Airtable.')
-    if not text.strip(): raise HTTPException(400,'CSV file is empty.')
-    try:
-        dialect=csv.Sniffer().sniff(text[:4096], delimiters=',;\t')
-        reader=csv.DictReader(io.StringIO(text), dialect=dialect)
-    except Exception: reader=csv.DictReader(io.StringIO(text))
-    columns=[str(x or '').strip() for x in (reader.fieldnames or [])]
-    if not columns: raise HTTPException(400,'CSV header row is missing.')
-    rows=[]
-    for raw in reader:
-        row={str(k or '').strip():str(v or '').strip() for k,v in raw.items() if k is not None}
-        if any(row.values()): rows.append(row)
-    if len(rows)>100: raise HTTPException(400,'CSV contains more than 100 rows per batch. Split it into smaller files to avoid request timeouts.')
-    return columns,rows
-
-@app.post('/api/csv/preview')
-async def preview_csv(file:UploadFile=File(...), u=Depends(current_user)):
-    data=await file.read(5*1024*1024+1)
-    columns,rows=_read_csv_upload(data)
-    return {'columns':columns,'row_count':len(rows),'preview':rows[:5]}
-
-@app.post('/api/csv/send')
-async def send_csv(
-    file:UploadFile=File(...), template_id:int=Form(...), name_column:str=Form(''),
-    phone_column:str=Form(...), variables_json:str=Form('[]'), header_image:UploadFile=File(None), u=Depends(current_user)
-):
-    data=await file.read(5*1024*1024+1)
-    columns,rows=_read_csv_upload(data)
-    if not rows: raise HTTPException(400,'CSV has no data rows.')
-    if phone_column not in columns: raise HTTPException(400,'Selected phone column is not present in the CSV.')
-    try: variable_columns=json.loads(variables_json or '[]')
-    except Exception: raise HTTPException(400,'Invalid template variable mapping.')
-    if not isinstance(variable_columns,list) or any(x and x not in columns for x in variable_columns):
-        raise HTTPException(400,'One or more template variable columns are not present in the CSV.')
-    c=db()
-    template=c.execute("SELECT * FROM templates WHERE id=? AND user_id=?",(template_id,u['id'])).fetchone()
-    if not template: c.close(); raise HTTPException(404,'Template not found.')
-    if str(template['approval_status'] or '').upper()!='APPROVED':
-        c.close(); raise HTTPException(400,'Only APPROVED WhatsApp templates can be sent.')
-    batch_header_media_url=template['header_media_url'] or ''
-    if batch_header_media_url:
-        if header_image is None:
-            c.close(); raise HTTPException(400,'This is an image-header template. Upload the same JPG/PNG image again for this send batch so the media link is fresh.')
-        image_name=(header_image.filename or 'template-image').strip()
-        image_type=(header_image.content_type or '').lower()
-        if image_type not in ('image/jpeg','image/png') and not image_name.lower().endswith(('.jpg','.jpeg','.png')):
-            c.close(); raise HTTPException(400,'Batch header image must be JPG or PNG.')
-        image_data=await header_image.read(5*1024*1024+1)
-        if not image_data or len(image_data)>5*1024*1024:
-            c.close(); raise HTTPException(400,'Batch header image must be non-empty and 5 MB or smaller.')
-        if image_type not in ('image/jpeg','image/png'):
-            image_type='image/png' if image_name.lower().endswith('.png') else 'image/jpeg'
-        try:
-            upload_resp=requests.post('https://public.doubletick.io/media/upload',
-                headers={'Authorization':os.getenv('DOUBLETICK_API_KEY','').strip(),'Accept':'application/json'},
-                files={'file':(image_name,image_data,image_type)},timeout=45)
-            upload_body=upload_resp.json()
-        except Exception as exc:
-            c.close(); raise HTTPException(502,'Could not upload batch image to DoubleTick: '+str(exc))
-        if not upload_resp.ok or not (upload_body.get('mediaUrl') or upload_body.get('url')):
-            c.close(); raise HTTPException(502,f'DoubleTick batch image upload failed: {upload_body}')
-        batch_header_media_url=upload_body.get('mediaUrl') or upload_body.get('url')
-    expected_vars=len(re.findall(r'\{\{\s*\d+\s*\}\}',template['content'] or ''))
-    if expected_vars and len(variable_columns)!=expected_vars:
-        c.close(); raise HTTPException(400,f'This template needs {expected_vars} variable column(s).')
-    prepared=[]; skipped=[]
-    for index,row in enumerate(rows,start=2):
-        digits=re.sub(r'\D','',row.get(phone_column,''))
-        if len(digits)==10: digits='91'+digits
-        if not (10<=len(digits)<=15):
-            skipped.append({'row':index,'reason':'Missing/invalid phone'}); continue
-        name=row.get(name_column,'') if name_column else ''
-        candidate={'Candidate Name':name,'Mobile Number':'+'+digits,'Phone':'+'+digits,
-                   '_template_variables':[row.get(col,'') if col else '' for col in variable_columns]}
-        prepared.append((candidate,index))
-    if not prepared:
-        c.close(); raise HTTPException(400,'No valid phone numbers found in the selected CSV column.')
-    if u['role']!='admin':
-        limit=int(get_setting('max_messages_per_user_per_day','50'))
-        if DATABASE_URL:
-            used=c.execute("SELECT COUNT(*) n FROM logs WHERE user_id=? AND (created_at + interval '5 hours 30 minutes')::date=(CURRENT_TIMESTAMP + interval '5 hours 30 minutes')::date",(u['id'],)).fetchone()['n']
-        else:
-            used=c.execute("SELECT COUNT(*) n FROM logs WHERE user_id=? AND date(created_at,'+5 hours','+30 minutes')=date('now','+5 hours','+30 minutes')",(u['id'],)).fetchone()['n']
-        remaining=max(0,limit-used)
-        if len(prepared)>remaining:
-            c.close(); raise HTTPException(429,f'Daily WhatsApp limit reached. You can send {remaining} more message(s) today; CSV has {len(prepared)} valid recipients.')
-    ids=[]
-    for candidate,_ in prepared:
-        cur=c.execute("INSERT INTO logs(user_id,candidate_name,phone,kind,template_name,status,detail) VALUES(?,?,?,?,?,'PROCESSING','CSV upload send reserved')",
-                      (u['id'],candidate['Candidate Name'],candidate['Mobile Number'],'approved',template['template_name']))
-        ids.append(cur.lastrowid)
-    c.commit()
-    results=[]
-    for (candidate,rownum),log_id in zip(prepared,ids):
-        status='FAILED'; detail=''; provider_id=''
-        try:
-            response=send_doubletick_candidate_message(candidate,template['template_name'],template['language'] or 'en',
-                                                       header_media_url=batch_header_media_url)
-            provider_id=_find_provider_message_id(response)
-            provider_status,provider_error=_find_provider_status(response)
-            if provider_status=='FAILED':
-                status='FAILED'; detail=provider_error or json.dumps(response,ensure_ascii=False)[:1200]
-            elif provider_status in ('SENT','DELIVERED','READ','ENQUEUED'):
-                status=provider_status; detail=json.dumps(response,ensure_ascii=False)[:1200]
-            else:
-                status='ENQUEUED'; detail=json.dumps(response,ensure_ascii=False)[:1200]
-        except Exception as exc: detail=str(exc)[:1200]
-        current=c.execute('SELECT status FROM logs WHERE id=?',(log_id,)).fetchone()
-        current_status=str(current['status'] or '') if current else ''
-        if current_status not in ('SENT','DELIVERED','READ','FAILED'):
-            c.execute('UPDATE logs SET status=?,detail=?,provider_message_id=?,status_updated_at=CURRENT_TIMESTAMP WHERE id=?',(status,detail,provider_id,log_id))
-        elif provider_id: c.execute('UPDATE logs SET provider_message_id=? WHERE id=?',(provider_id,log_id))
-        c.commit()
-        results.append({'row':rownum,'name':candidate['Candidate Name'],'phone':candidate['Mobile Number'],
-                        'status':current_status if current_status in ('SENT','DELIVERED','READ','FAILED') else status,'detail':detail})
-    c.close()
-    return {'ok':True,'summary':{'total':len(results),'sent':sum(x['status'] in ('SENT','DELIVERED','READ','ENQUEUED') for x in results),
-                                  'failed':sum(x['status']=='FAILED' for x in results),'skipped':len(skipped)},
-            'skipped':skipped,'results':results}
-
-def _e164(value):
-    digits=re.sub(r'\D','',str(value or ''))
-    if len(digits)==10: digits='91'+digits
-    return '+'+digits if 10<=len(digits)<=15 else ''
-
-@app.post('/api/chats/{phone}/reply')
-def send_chat_reply(phone:str, x:ChatReplyIn, u=Depends(current_user)):
-    """Send a free-form WhatsApp reply through DoubleTick (24-hour session only)."""
-    digits=re.sub(r'\D','',phone)
-    if not digits: raise HTTPException(400,'Invalid phone number')
-    api_key=os.getenv('DOUBLETICK_API_KEY','').strip()
-    sender=_e164(os.getenv('DOUBLETICK_SENDER_NUMBER') or os.getenv('DOUBLETICK_WABA_NUMBER') or '')
-    recipient=_e164(digits)
-    if not api_key: raise HTTPException(503,'DOUBLETICK_API_KEY is not configured on the server.')
-    if not sender: raise HTTPException(503,'Set DOUBLETICK_SENDER_NUMBER (your WhatsApp sender number) in Render.')
-    if not recipient: raise HTTPException(400,'Candidate phone number must be a valid international number.')
-    c=db()
-    if u['role']!='admin':
-        if DATABASE_URL:
-            allowed=c.execute("SELECT 1 FROM logs WHERE user_id=? AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? LIMIT 1",(u['id'],digits[-10:])).fetchone()
-        else:
-            allowed=c.execute("SELECT 1 FROM logs WHERE user_id=? AND substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? LIMIT 1",(u['id'],digits[-10:])).fetchone()
-        if not allowed:
-            c.close(); raise HTTPException(403,'This conversation is not assigned to your HR account.')
-    msg_id=str(uuid.uuid4())
-    payload={'to':recipient,'from':sender,'messageId':msg_id,'content':{'text':x.message.strip()}}
-    try:
-        resp=requests.post('https://public.doubletick.io/whatsapp/message/text',
-                           headers={'Authorization':api_key,'Content-Type':'application/json','Accept':'application/json'},
-                           json=payload,timeout=30)
-        try: body=resp.json()
-        except Exception: body={'raw':resp.text[:1500]}
-    except requests.RequestException as exc:
-        c.close(); raise HTTPException(502,f'DoubleTick connection failed: {exc}')
-    if resp.status_code not in (200,201,202):
-        c.close()
-        detail=body.get('message') or body.get('error') or body
-        raise HTTPException(resp.status_code if 400<=resp.status_code<500 else 502,
-            f'DoubleTick rejected reply. Free-form replies require an active 24-hour customer service window. Provider response: {detail}')
-    provider_id=_find_provider_message_id(body) or msg_id
-    if DATABASE_URL:
-        name_row=c.execute("SELECT candidate_name FROM logs WHERE RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? ORDER BY id DESC LIMIT 1",(digits[-10:],)).fetchone()
-    else:
-        name_row=c.execute("SELECT candidate_name FROM logs WHERE substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? ORDER BY id DESC LIMIT 1",(digits[-10:],)).fetchone()
-    candidate_name=name_row['candidate_name'] if name_row else ''
-    c.execute("INSERT INTO chat_messages(user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id,status) VALUES(?,?,?,?,?,?,?,?,?)",
-              (u['id'],digits,candidate_name,'OUT','TEXT',x.message.strip(),'',provider_id,'SENT'))
-    c.commit(); c.close()
-    return {'ok':True,'status':'SENT','message_id':provider_id,'provider':body}
-
 @app.get('/api/chats')
 def chats(u=Depends(current_user)):
     c=db()
@@ -834,10 +713,10 @@ def chat_detail(phone:str,u=Depends(current_user)):
     if not digits: raise HTTPException(400,'Invalid phone number')
     c=db()
     if u['role']=='admin':
-        incoming=c.execute('SELECT id,user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id,status,created_at FROM chat_messages WHERE phone=? ORDER BY id ASC LIMIT 1000',(digits,)).fetchall()
+        incoming=c.execute('SELECT id,user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id,created_at FROM chat_messages WHERE phone=? ORDER BY id ASC LIMIT 1000',(digits,)).fetchall()
         outgoing=c.execute("SELECT id,user_id,phone,candidate_name,'OUT' direction,kind message_type,template_name content,'' media_url,provider_message_id,created_at,status FROM logs WHERE REPLACE(REPLACE(REPLACE(phone,'+',''),' ',''),'-','') LIKE ? ORDER BY id ASC LIMIT 1000",('%'+digits[-10:],)).fetchall()
     else:
-        incoming=c.execute('SELECT id,user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id,status,created_at FROM chat_messages WHERE phone=? AND user_id=? ORDER BY id ASC LIMIT 1000',(digits,u['id'])).fetchall()
+        incoming=c.execute('SELECT id,user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id,created_at FROM chat_messages WHERE phone=? AND user_id=? ORDER BY id ASC LIMIT 1000',(digits,u['id'])).fetchall()
         outgoing=c.execute("SELECT id,user_id,phone,candidate_name,'OUT' direction,kind message_type,template_name content,'' media_url,provider_message_id,created_at,status FROM logs WHERE user_id=? AND REPLACE(REPLACE(REPLACE(phone,'+',''),' ',''),'-','') LIKE ? ORDER BY id ASC LIMIT 1000",(u['id'],'%'+digits[-10:])).fetchall()
     items=[dict(x) for x in incoming]+[dict(x) for x in outgoing]
     items.sort(key=lambda x:str(x.get('created_at') or ''))

@@ -65,6 +65,9 @@ def db():
         for col,ddl in {'language':"TEXT DEFAULT 'en'",'category':"TEXT DEFAULT 'MARKETING'",'approval_status':"TEXT DEFAULT 'DRAFT'",'header_text':"TEXT DEFAULT ''",'footer_text':"TEXT DEFAULT ''",'provider_detail':"TEXT DEFAULT ''",'submitted_at':"TEXT DEFAULT ''",'header_media_url':"TEXT DEFAULT ''"}.items():
             if col not in existing: c.execute(f'ALTER TABLE templates ADD COLUMN {col} {ddl}')
         c.execute("CREATE TABLE IF NOT EXISTS chat_messages(id BIGSERIAL PRIMARY KEY, user_id BIGINT, phone TEXT NOT NULL, candidate_name TEXT DEFAULT '', direction TEXT NOT NULL, message_type TEXT DEFAULT 'TEXT', content TEXT DEFAULT '', media_url TEXT DEFAULT '', provider_message_id TEXT DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        chat_cols={r['name'] for r in c.execute("SELECT column_name AS name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='chat_messages'").fetchall()}
+        if 'is_read' not in chat_cols: c.execute("ALTER TABLE chat_messages ADD COLUMN is_read INTEGER NOT NULL DEFAULT 0")
+        c.execute("CREATE TABLE IF NOT EXISTS internal_notes(id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, phone TEXT NOT NULL, note TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         c.execute("CREATE TABLE IF NOT EXISTS logs(id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, candidate_name TEXT, phone TEXT, kind TEXT, template_name TEXT, status TEXT, detail TEXT, provider_message_id TEXT DEFAULT '', status_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         log_cols={r['name'] for r in c.execute("SELECT column_name AS name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='logs'").fetchall()}
         for col,ddl in {'provider_message_id':"TEXT DEFAULT ''",'status_updated_at':"TIMESTAMP DEFAULT CURRENT_TIMESTAMP"}.items():
@@ -78,6 +81,9 @@ def db():
     for col,ddl in {'language':"TEXT DEFAULT 'en'",'category':"TEXT DEFAULT 'MARKETING'",'approval_status':"TEXT DEFAULT 'DRAFT'",'header_text':"TEXT DEFAULT ''",'footer_text':"TEXT DEFAULT ''",'provider_detail':"TEXT DEFAULT ''",'submitted_at':"TEXT DEFAULT ''",'header_media_url':"TEXT DEFAULT ''"}.items():
         if col not in existing: c.execute(f'ALTER TABLE templates ADD COLUMN {col} {ddl}')
     c.execute("CREATE TABLE IF NOT EXISTS chat_messages(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, phone TEXT NOT NULL, candidate_name TEXT DEFAULT '', direction TEXT NOT NULL, message_type TEXT DEFAULT 'TEXT', content TEXT DEFAULT '', media_url TEXT DEFAULT '', provider_message_id TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+    chat_cols={r['name'] for r in c.execute('PRAGMA table_info(chat_messages)').fetchall()}
+    if 'is_read' not in chat_cols: c.execute("ALTER TABLE chat_messages ADD COLUMN is_read INTEGER NOT NULL DEFAULT 0")
+    c.execute("CREATE TABLE IF NOT EXISTS internal_notes(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, phone TEXT NOT NULL, note TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
     c.execute("CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, candidate_name TEXT, phone TEXT, kind TEXT, template_name TEXT, status TEXT, detail TEXT, provider_message_id TEXT DEFAULT '', status_updated_at TEXT DEFAULT CURRENT_TIMESTAMP, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
     existing_logs={r['name'] for r in c.execute('PRAGMA table_info(logs)').fetchall()}
     for col,ddl in {'provider_message_id':"TEXT DEFAULT ''",'status_updated_at':"TEXT DEFAULT CURRENT_TIMESTAMP"}.items():
@@ -1041,6 +1047,55 @@ def send_chat_reply(phone:str, x:ChatReplyIn, u=Depends(current_user)):
     c.commit(); c.close()
     return {'ok':True,'status':'SENT','message_id':provider_id,'provider':body}
 
+
+def _chat_phone_allowed(c,digits,u):
+    if u['role']=='admin': return True
+    if DATABASE_URL:
+        row=c.execute("SELECT 1 FROM logs WHERE user_id=? AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? LIMIT 1",(u['id'],digits[-10:])).fetchone()
+    else:
+        row=c.execute("SELECT 1 FROM logs WHERE user_id=? AND substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? LIMIT 1",(u['id'],digits[-10:])).fetchone()
+    return bool(row)
+
+@app.post('/api/chats/{phone}/read')
+def mark_chat_read(phone:str,u=Depends(current_user)):
+    digits=re.sub(r'\D','',phone)
+    if not digits: raise HTTPException(400,'Invalid phone number')
+    c=db()
+    try:
+        if not _chat_phone_allowed(c,digits,u): raise HTTPException(403,'This conversation is not assigned to your HR account.')
+        if u['role']=='admin': c.execute("UPDATE chat_messages SET is_read=1 WHERE phone=? AND direction='IN'",(digits,))
+        else: c.execute("UPDATE chat_messages SET is_read=1 WHERE phone=? AND user_id=? AND direction='IN'",(digits,u['id']))
+        c.commit(); return {'ok':True,'marked_read':True}
+    finally: c.close()
+
+@app.get('/api/chats/{phone}/notes')
+def get_internal_notes(phone:str,u=Depends(current_user)):
+    digits=re.sub(r'\D','',phone)
+    if not digits: raise HTTPException(400,'Invalid phone number')
+    c=db()
+    try:
+        if not _chat_phone_allowed(c,digits,u): raise HTTPException(403,'This conversation is not assigned to your HR account.')
+        rows=c.execute("SELECT n.id,n.user_id,n.phone,n.note,n.created_at,COALESCE(us.username,'Unknown') username FROM internal_notes n LEFT JOIN users us ON us.id=n.user_id WHERE n.phone=? ORDER BY n.id DESC LIMIT 200",(digits,)).fetchall()
+        return [dict(x) for x in rows]
+    finally: c.close()
+
+@app.post('/api/chats/{phone}/notes')
+async def add_internal_note(phone:str,request:Request,u=Depends(current_user)):
+    digits=re.sub(r'\D','',phone)
+    if not digits: raise HTTPException(400,'Invalid phone number')
+    try: payload=await request.json()
+    except Exception: payload={}
+    note=str((payload or {}).get('note') or '').strip()
+    if not note: raise HTTPException(400,'Please enter an internal note.')
+    if len(note)>3000: raise HTTPException(400,'Internal note must be 3000 characters or less.')
+    c=db()
+    try:
+        if not _chat_phone_allowed(c,digits,u): raise HTTPException(403,'This conversation is not assigned to your HR account.')
+        c.execute("INSERT INTO internal_notes(user_id,phone,note) VALUES(?,?,?)",(u['id'],digits,note))
+        c.commit(); return {'ok':True,'message':'Internal note saved.'}
+    finally: c.close()
+
+
 @app.get('/api/analytics')
 def analytics(days: int = 30, u=Depends(current_user)):
     """Daily WhatsApp message analytics in India time (Asia/Kolkata).
@@ -1172,15 +1227,15 @@ def analytics(days: int = 30, u=Depends(current_user)):
 def chats(u=Depends(current_user)):
     c=db()
     if u['role']=='admin':
-        rows=c.execute("SELECT phone,MAX(candidate_name) candidate_name,MAX(created_at) last_at,COUNT(*) message_count FROM chat_messages GROUP BY phone ORDER BY last_at DESC LIMIT 500").fetchall()
+        rows=c.execute("SELECT phone,MAX(candidate_name) candidate_name,MAX(created_at) last_at,COUNT(*) message_count,SUM(CASE WHEN direction='IN' AND COALESCE(is_read,0)=0 THEN 1 ELSE 0 END) unread_count FROM chat_messages GROUP BY phone ORDER BY last_at DESC LIMIT 500").fetchall()
         sent=c.execute("SELECT phone,MAX(candidate_name) candidate_name,MAX(created_at) last_at,COUNT(*) message_count FROM logs GROUP BY phone ORDER BY last_at DESC LIMIT 500").fetchall()
     else:
-        rows=c.execute("SELECT phone,MAX(candidate_name) candidate_name,MAX(created_at) last_at,COUNT(*) message_count FROM chat_messages WHERE user_id=? GROUP BY phone ORDER BY last_at DESC LIMIT 300",(u['id'],)).fetchall()
+        rows=c.execute("SELECT phone,MAX(candidate_name) candidate_name,MAX(created_at) last_at,COUNT(*) message_count,SUM(CASE WHEN direction='IN' AND COALESCE(is_read,0)=0 THEN 1 ELSE 0 END) unread_count FROM chat_messages WHERE user_id=? GROUP BY phone ORDER BY last_at DESC LIMIT 300",(u['id'],)).fetchall()
         sent=c.execute("SELECT phone,MAX(candidate_name) candidate_name,MAX(created_at) last_at,COUNT(*) message_count FROM logs WHERE user_id=? GROUP BY phone ORDER BY last_at DESC LIMIT 300",(u['id'],)).fetchall()
     merged={re.sub(r'\D','',str(r['phone'] or '')):dict(r) for r in rows}
     for r in sent:
         key=re.sub(r'\D','',str(r['phone'] or ''))
-        if key: merged[key]=dict(r) if key not in merged else {**merged[key], 'last_at':max(str(merged[key].get('last_at') or ''),str(r['last_at'] or ''))}
+        if key: merged[key]=({**dict(r), 'unread_count':0} if key not in merged else {**merged[key], 'last_at':max(str(merged[key].get('last_at') or ''),str(r['last_at'] or ''))})
     c.close(); return sorted(merged.values(),key=lambda x:str(x.get('last_at') or ''),reverse=True)
 
 @app.get('/api/chats/{phone}')

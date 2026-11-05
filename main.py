@@ -1068,6 +1068,28 @@ def mark_chat_read(phone:str,u=Depends(current_user)):
         c.commit(); return {'ok':True,'marked_read':True}
     finally: c.close()
 
+@app.get('/api/admin/internal-notes')
+def admin_all_internal_notes(q:str='',hr_id:int=0,limit:int=500,u=Depends(current_user)):
+    if u['role']!='admin':
+        raise HTTPException(403,'Admin access required.')
+    limit=max(1,min(int(limit or 500),1000))
+    c=db()
+    try:
+        where=[]; params=[]
+        if hr_id>0:
+            where.append('n.user_id=?'); params.append(hr_id)
+        if q.strip():
+            term='%'+q.strip()+'%'
+            where.append("(n.phone LIKE ? OR n.note LIKE ? OR COALESCE(us.username,'') LIKE ? OR COALESCE((SELECT MAX(cm.candidate_name) FROM chat_messages cm WHERE cm.phone=n.phone),'') LIKE ?)")
+            params.extend([term,term,term,term])
+        clause=(' WHERE '+' AND '.join(where)) if where else ''
+        rows=c.execute("SELECT n.id,n.user_id,n.phone,n.note,n.created_at,COALESCE(us.username,'Unknown') username,COALESCE((SELECT MAX(cm.candidate_name) FROM chat_messages cm WHERE cm.phone=n.phone),'') candidate_name FROM internal_notes n LEFT JOIN users us ON us.id=n.user_id"+clause+" ORDER BY n.id DESC LIMIT ?",tuple(params+[limit])).fetchall()
+        hrs=c.execute("SELECT id,username FROM users WHERE role='hr' ORDER BY username").fetchall()
+        return {'notes':[dict(x) for x in rows],'hr_users':[dict(x) for x in hrs],'total':len(rows)}
+    finally:
+        c.close()
+
+
 @app.get('/api/chats/{phone}/notes')
 def get_internal_notes(phone:str,u=Depends(current_user)):
     digits=re.sub(r'\D','',phone)

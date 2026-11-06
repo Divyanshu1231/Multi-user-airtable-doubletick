@@ -268,6 +268,100 @@ def _status_sync_loop():
 def history_sync_status(u=Depends(current_user)):
     return sync_pending_statuses(None if u['role']=='admin' else u['id'],limit=15)
 
+
+# ---- Import old customer replies from DoubleTick (backfill) ----
+_backfill_state={'running':False,'total':0,'done':0,'inserted':0,'skipped_existing':0,'not_found':0,'errors':0,'last_error':'','finished':False}
+_backfill_lock=threading.Lock()
+
+def _run_chat_backfill(days, max_phones):
+    from datetime import datetime, timedelta, timezone
+    st=_backfill_state
+    key=os.getenv('DOUBLETICK_API_KEY','').strip()
+    try:
+        waba=dt_sender_number()
+    except Exception as exc:
+        st.update(running=False,finished=True,last_error=str(getattr(exc,'detail',exc))); return
+    if not key:
+        st.update(running=False,finished=True,last_error='DOUBLETICK_API_KEY missing'); return
+    start=(datetime.now(timezone.utc)+timedelta(hours=5,minutes=30)-timedelta(days=days)).strftime('%d-%m-%Y')
+    c=db()
+    try:
+        rows=c.execute("SELECT phone,MAX(id) mid FROM logs WHERE COALESCE(phone,'')<>'' GROUP BY phone ORDER BY mid DESC LIMIT ?",(max_phones,)).fetchall()
+        phones=[]; seen=set()
+        for r in rows:
+            d=re.sub(r'\D','',str(r['phone'] or ''))
+            if len(d)==10: d='91'+d
+            if len(d)>=11 and d not in seen: seen.add(d); phones.append(d)
+        st['total']=len(phones)
+        for d in phones:
+            try:
+                resp=requests.get('https://public.doubletick.io/chat-messages',
+                                  headers={'Authorization':key,'Accept':'application/json'},
+                                  params={'wabaNumber':waba,'customerNumber':d,'startDate':start},timeout=30)
+                if resp.status_code==429:
+                    time.sleep(10); resp=requests.get('https://public.doubletick.io/chat-messages',
+                                  headers={'Authorization':key,'Accept':'application/json'},
+                                  params={'wabaNumber':waba,'customerNumber':d,'startDate':start},timeout=30)
+                if resp.status_code==404: st['not_found']+=1
+                elif resp.status_code not in (200,201):
+                    st['errors']+=1; st['last_error']=f'HTTP {resp.status_code}: {resp.text[:200]}'
+                else:
+                    data=resp.json()
+                    items=data.get('messages') if isinstance(data,dict) else data
+                    owner=c.execute("SELECT user_id,candidate_name FROM logs WHERE RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? ORDER BY id DESC LIMIT 1" if DATABASE_URL else
+                                    "SELECT user_id,candidate_name FROM logs WHERE substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? ORDER BY id DESC LIMIT 1",(d[-10:],)).fetchone()
+                    for it in (items or []):
+                        if not isinstance(it,dict): continue
+                        if str(it.get('messageOriginType') or '').upper()!='CUSTOMER': continue
+                        mid=str(it.get('id') or '').strip()
+                        m=it.get('message') if isinstance(it.get('message'),dict) else {}
+                        mtype=str(m.get('messageType') or 'TEXT').upper()
+                        media=str(m.get('url') or m.get('mediaUrl') or '')[:2000]
+                        text=m.get('text') or m.get('caption') or ''
+                        if isinstance(text,dict): text=text.get('body') or json.dumps(text,ensure_ascii=False)
+                        text=str(text or (f'[{mtype}]' if media else f'[{mtype} message]'))[:5000]
+                        ts=it.get('messageTime'); 
+                        try: when=datetime.fromtimestamp(int(ts)/1000,tz=timezone.utc)
+                        except Exception: when=datetime.now(timezone.utc)
+                        if mid and c.execute("SELECT id FROM chat_messages WHERE provider_message_id=? LIMIT 1",(mid,)).fetchone():
+                            st['skipped_existing']+=1; continue
+                        # Same text from same phone within 2 minutes of an already-saved webhook copy = duplicate.
+                        dup=False
+                        for ex in c.execute("SELECT created_at FROM chat_messages WHERE phone=? AND direction='IN' AND content=?",(d,text)).fetchall():
+                            try:
+                                exd=ex['created_at'] if not isinstance(ex['created_at'],str) else datetime.fromisoformat(ex['created_at'].replace('T',' ').split('.')[0])
+                                if abs((exd.replace(tzinfo=None)-when.replace(tzinfo=None)).total_seconds())<180: dup=True; break
+                            except Exception: pass
+                        if dup: st['skipped_existing']+=1; continue
+                        is_read=0 if (datetime.now(timezone.utc)-when).total_seconds()<48*3600 else 1
+                        name=str((owner['candidate_name'] if owner else '') or d)[:200]
+                        c.execute("INSERT INTO chat_messages(user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id,created_at,is_read) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                                  (owner['user_id'] if owner else None,d,name,'IN',mtype,text,media,mid,when.strftime('%Y-%m-%d %H:%M:%S'),is_read))
+                        st['inserted']+=1
+                    c.commit()
+            except Exception as exc:
+                try: c.rollback()
+                except Exception: pass
+                st['errors']+=1; st['last_error']=str(exc)[:200]
+            st['done']+=1
+            time.sleep(0.3)
+    finally:
+        c.close(); st.update(running=False,finished=True)
+        _backfill_lock.release()
+
+@app.post('/api/chats/backfill')
+def chats_backfill(days:int=30,max_phones:int=3000,u=Depends(admin)):
+    days=max(1,min(days,90)); max_phones=max(1,min(max_phones,10000))
+    if not _backfill_lock.acquire(blocking=False):
+        return {'ok':True,'already_running':True,**_backfill_state}
+    _backfill_state.update(running=True,finished=False,total=0,done=0,inserted=0,skipped_existing=0,not_found=0,errors=0,last_error='')
+    threading.Thread(target=_run_chat_backfill,args=(days,max_phones),daemon=True).start()
+    return {'ok':True,'started':True,**_backfill_state}
+
+@app.get('/api/chats-backfill-status')
+def chats_backfill_status(u=Depends(admin)):
+    return dict(_backfill_state)
+
 @app.on_event('startup')
 def startup():
     threading.Thread(target=_status_sync_loop,daemon=True).start()

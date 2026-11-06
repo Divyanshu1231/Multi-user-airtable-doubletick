@@ -636,11 +636,50 @@ def _doubletick_webhook_auth(request: Request, x_webhook_secret: Optional[str] =
         raise HTTPException(401, 'Invalid webhook token')
 
 
+def recipient_digits_for_audit(d):
+    try:
+        v = d.get('to') or d.get('recipient') or d.get('phone') or ''
+        return re.sub(r'\D', '', str(v if not isinstance(v, dict) else v.get('phone', '')))
+    except Exception:
+        return ''
+
+
+def _dt_audit(event, message_id, phone, raw_status, normalized, detail, payload, result, log_id=None):
+    """Record every webhook hit so missing/ignored events can be diagnosed. Never raises."""
+    try:
+        c = db()
+        try:
+            text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False, default=str)
+            c.execute(
+                "INSERT INTO doubletick_webhook_events(event_type,provider_message_id,recipient_phone,provider_status,normalized_status,detail,payload_json,matched_log_id,processing_result) VALUES(?,?,?,?,?,?,?,?,?)",
+                (event or 'UNKNOWN', message_id or '', phone or '', raw_status or '', normalized or '',
+                 str(detail or '')[:1500], text[:6000], log_id, result))
+            c.commit()
+        finally:
+            c.close()
+    except Exception:
+        import logging
+        logging.getLogger("uvicorn.error").exception("DoubleTick webhook audit write failed")
+
+
 @app.get('/api/webhooks/doubletick')
 async def doubletick_webhook_verify(request: Request,
                                     x_webhook_secret: Optional[str] = Header(None)):
-    """Support provider URL-verification/health checks that use GET."""
+    """Support provider URL-verification/health checks that use GET.
+    Add &debug=1 to see the last 30 webhook hits (same token required)."""
     _doubletick_webhook_auth(request, x_webhook_secret)
+    if request.query_params.get('debug'):
+        c = db()
+        try:
+            rows = c.execute("SELECT id,event_type,recipient_phone,provider_status,processing_result,detail,created_at,payload_json FROM doubletick_webhook_events ORDER BY id DESC LIMIT 30").fetchall()
+            inc = c.execute("SELECT COUNT(*) n FROM chat_messages WHERE direction='IN'").fetchone()
+        finally:
+            c.close()
+        events = []
+        for r in rows:
+            d = dict(r); d['created_at'] = str(d.get('created_at')); d['payload_json'] = str(d.get('payload_json') or '')[:600]
+            events.append(d)
+        return {'ok': True, 'incoming_messages_in_db': inc['n'] if inc else 0, 'last_events': events}
     return {'ok': True, 'webhook': 'DoubleTick', 'method': 'GET',
             'message': 'Webhook URL is reachable. Send events using POST.'}
 
@@ -699,6 +738,7 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
                 raise HTTPException(400, 'Webhook body must be valid JSON or form data')
     else:
         logger.warning("DoubleTick webhook received an empty POST body; content_type=%s", content_type)
+        _dt_audit('EMPTY_BODY','','','','','Empty POST body; content_type='+content_type,'', 'ignored_empty')
         return {'ok': True, 'ignored': True, 'reason': 'Empty webhook body'}
 
     if isinstance(payload, list):
@@ -706,9 +746,11 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
             payload = payload[0]
         else:
             logger.info("DoubleTick webhook acknowledged list payload (%s items)", len(payload))
+            _dt_audit('LIST_PAYLOAD','','','','','',raw_body.decode('utf-8','replace'),'ignored_list')
             return {'ok': True, 'ignored': True, 'reason': 'Unsupported list payload'}
     if not isinstance(payload, dict):
         logger.info("DoubleTick webhook acknowledged non-object payload")
+        _dt_audit('NON_OBJECT','','','','','',raw_body.decode('utf-8','replace'),'ignored_non_object')
         return {'ok': True, 'ignored': True, 'reason': 'Payload is not an object'}
 
     # Unwrap nested provider envelopes. DoubleTick integrations can deliver
@@ -822,6 +864,7 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
         if not phone_digits:
             logger.warning("DoubleTick incoming event has no sender phone; keys=%s",
                            list(event_data.keys())[:30])
+            _dt_audit(event or 'MESSAGE_RECEIVED','','','','','Sender phone missing',payload,'ignored_no_phone')
             return {'ok': True, 'ignored': True, 'reason': 'Sender phone missing'}
         candidate_name = str(contact.get('name') or customer_obj.get('name') or
                              _first_value(('customerName', 'customer_name', 'profileName', 'pushName', 'name')) or
@@ -862,6 +905,9 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
                      str(text_value)[:5000], media_url[:2000], message_id)
                 )
                 c.commit()
+            _dt_audit(event or 'MESSAGE_RECEIVED', message_id, phone_digits, '', 'IN',
+                      'assigned_user_id=%s' % user_id, payload,
+                      'incoming_duplicate' if duplicate else ('incoming_saved_assigned' if user_id else 'incoming_saved_unassigned_admin_only'))
             logger.info("DoubleTick incoming saved=%s assigned=%s type=%s phone_last4=%s",
                         not bool(duplicate), bool(user_id), message_type, phone_digits[-4:])
             return {'ok': True, 'event': 'MESSAGE_RECEIVED',
@@ -913,6 +959,7 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
         if status not in ('SENT', 'DELIVERED', 'READ', 'FAILED', 'ENQUEUED', 'PROCESSING'):
             logger.info("DoubleTick status event unsupported: event=%s status=%s message_id_present=%s",
                         event, raw_status or 'MISSING', bool(message_id))
+            _dt_audit(event, message_id, recipient_digits_for_audit(event_data), raw_status, '', 'Unsupported or missing status', payload, 'ignored_unsupported_status')
             return {'ok': True, 'ignored': True, 'reason': 'Unsupported or missing status', 'provider_status': raw_status}
 
         recipient_value = _first_value(('to', 'recipient', 'recipientPhone', 'recipient_phone',
@@ -1034,6 +1081,7 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
 
     logger.info("DoubleTick unsupported event acknowledged: event=%s keys=%s",
                 event or 'UNKNOWN', list(event_data.keys())[:30])
+    _dt_audit(event or 'UNKNOWN', '', '', '', '', 'Unsupported event', payload, 'ignored_unsupported_event')
     return {'ok': True, 'ignored': True, 'event': event or 'UNKNOWN'}
 
 @app.post('/api/send')

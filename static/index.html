@@ -137,6 +137,7 @@ async function chatsPage(){
  chatRefreshTimer=setInterval(()=>refreshChats().catch(e=>console.warn(e)),10000);
 }
 async function refreshChats(){
+ api('/history/sync-status',{method:'POST'}).catch(()=>{});
  const a=await api('/chats'),list=$('chatlist');
  if(list){list.innerHTML=chatListHtml(a);filterChatList()}
  if(activeChatPhone && $('chatdetail')) await renderChat(activeChatPhone,activeChatName);
@@ -218,8 +219,9 @@ let historyRowsCache=[];
 async function historyPage(){
  $('view').innerHTML=`<div class="heading"><div><h1>Message History</h1><div class="muted">${me.role==='admin'?'All recruiter/team member':'Your'} recent sending activity. Filter records and export the results to CSV.</div></div><button class="btn secondary" onclick="refreshHistoryTable()">↻ Refresh</button></div><div class="card"><div class="grid" style="grid-template-columns:repeat(3,minmax(0,1fr))"><div class="field"><label>Status</label><select id="historyStatus" onchange="refreshHistoryTable()"><option value="">All statuses</option><option>SENT</option><option>DELIVERED</option><option>READ</option><option value="FREQUENCY_CAPPING">Frequency Capping</option></select></div>${me.role==='admin'?`<div class="field"><label>Recruiter / Team Member</label><select id="historyUser" onchange="refreshHistoryTable()"><option value="">All users</option></select></div>`:''}<div class="field"><label>Search candidate / mobile / template</label><input id="historySearch" placeholder="Search…" onkeydown="if(event.key==='Enter')refreshHistoryTable()"></div><div class="field"><label>From date</label><input id="historyFrom" type="date" onchange="refreshHistoryTable()"></div><div class="field"><label>To date</label><input id="historyTo" type="date" onchange="refreshHistoryTable()"></div></div><div class="row"><span id="historyCount" class="muted small">Loading…</span><button class="btn secondary" onclick="clearHistoryFilters()">Clear filters</button><button class="btn right" onclick="exportHistoryCsv()">Export filtered CSV</button></div></div><div class="card"><div class="tablewrap"><table><thead><tr>${me.role==='admin'?'<th>Recruiter / Team Member</th>':''}<th>Candidate</th>${me.role==='admin'?'<th>Phone</th>':''}<th>Type</th><th>Template</th><th>Status</th><th>Date</th><th>Details</th></tr></thead><tbody id="historybody"><tr><td colspan="8">Loading…</td></tr></tbody></table></div></div>`;
  if(me.role==='admin'){try{const users=await api('/admin/users');const sel=$('historyUser');sel.innerHTML='<option value="">All users</option>'+users.map(x=>`<option value="${x.id}">${esc(x.username)}</option>`).join('')}catch(e){console.warn('Could not load user filter',e)}}
+ api('/history/sync-status',{method:'POST'}).then(()=>refreshHistoryTable()).catch(()=>{});
  await refreshHistoryTable();
- historyTimer=setInterval(()=>refreshHistoryTable().catch(e=>console.warn(e)),12000);
+ historyTimer=setInterval(()=>{api('/history/sync-status',{method:'POST'}).catch(()=>{});refreshHistoryTable().catch(e=>console.warn(e))},12000);
 }
 function clearHistoryFilters(){['historyStatus','historyUser','historySearch','historyFrom','historyTo'].forEach(id=>{if($(id))$(id).value=''});refreshHistoryTable()}
 async function refreshHistoryTable(){

@@ -1119,7 +1119,7 @@ async def add_internal_note(phone:str,request:Request,u=Depends(current_user)):
 
 
 @app.get('/api/analytics')
-def analytics(days: int = 30, u=Depends(current_user)):
+def analytics(days: int = 30, user_id: int = 0, u=Depends(current_user)):
     """Daily WhatsApp message analytics in India time (Asia/Kolkata).
 
     Campaign sends are counted from logs; incoming messages and chat replies
@@ -1167,6 +1167,10 @@ def analytics(days: int = 30, u=Depends(current_user)):
             (cutoff.strftime('%Y-%m-%d %H:%M:%S'),)
         ).fetchall()
         users = c.execute("SELECT id,username FROM users WHERE role='hr' ORDER BY username").fetchall()
+        if user_id:
+            log_rows = [r for r in log_rows if str(r['user_id']) == str(user_id)]
+            chat_rows = [r for r in chat_rows if str(r['user_id']) == str(user_id)]
+            users = [r for r in users if str(r['id']) == str(user_id)]
     else:
         log_rows = c.execute(
             "SELECT l.user_id,l.status,l.created_at,? username FROM logs l WHERE l.user_id=? AND l.created_at>=?",
@@ -1242,6 +1246,7 @@ def analytics(days: int = 30, u=Depends(current_user)):
         for hr in users:
             add_user(hr['id'], hr['username'])
         result['users'] = sorted(by_user.values(), key=lambda x: (x['total'], x['username']), reverse=True)
+        result['selected_user'] = next((dict(x) for x in users if user_id and str(x['id']) == str(user_id)), None)
     return result
 
 
@@ -1276,14 +1281,42 @@ def chat_detail(phone:str,u=Depends(current_user)):
     c.close(); return items
 
 @app.get('/api/history')
-def history(u=Depends(current_user)):
+def history(status: str = '', user_id: int = 0, from_date: str = '', to_date: str = '',
+            q: str = '', u=Depends(current_user)):
     c=db()
     # Mark abandoned reservations so they do not remain stuck as PROCESSING forever.
     if DATABASE_URL:
         c.execute("UPDATE logs SET status='UNKNOWN',detail='Previous send was interrupted before a provider result was saved. Check DoubleTick before retrying to avoid duplicate messages.',status_updated_at=CURRENT_TIMESTAMP WHERE status='PROCESSING' AND created_at < CURRENT_TIMESTAMP - INTERVAL '15 minutes'")
     else:
         c.execute("UPDATE logs SET status='UNKNOWN',detail='Previous send was interrupted before a provider result was saved. Check DoubleTick before retrying to avoid duplicate messages.',status_updated_at=CURRENT_TIMESTAMP WHERE status='PROCESSING' AND datetime(created_at) < datetime('now','-15 minutes')")
-    if u['role']=='admin': rows=c.execute('SELECT l.*,u.username FROM logs l JOIN users u ON u.id=l.user_id ORDER BY l.id DESC LIMIT 500').fetchall()
-    else: rows=c.execute('SELECT id,user_id,candidate_name,kind,template_name,status,detail,created_at,provider_message_id,status_updated_at FROM logs WHERE user_id=? ORDER BY id DESC LIMIT 300',(u['id'],)).fetchall()
-    c.commit(); c.close(); return [dict(r) for r in rows]
+
+    where=[]; params=[]
+    if u['role'] == 'admin':
+        base = "SELECT l.*,u.username FROM logs l LEFT JOIN users u ON u.id=l.user_id"
+        if user_id:
+            where.append("l.user_id=?"); params.append(user_id)
+    else:
+        base = "SELECT l.*,? AS username FROM logs l"
+        params.append(u['username'])
+        where.append("l.user_id=?"); params.append(u['id'])
+    if status:
+        where.append("UPPER(COALESCE(l.status,''))=?"); params.append(status.strip().upper())
+    if from_date:
+        where.append("DATE(l.created_at)>=DATE(?)"); params.append(from_date)
+    if to_date:
+        where.append("DATE(l.created_at)<=DATE(?)"); params.append(to_date)
+    if q:
+        like='%'+q.strip().lower()+'%'
+        where.append("(LOWER(COALESCE(l.candidate_name,'')) LIKE ? OR LOWER(COALESCE(l.phone,'')) LIKE ? OR LOWER(COALESCE(l.template_name,'')) LIKE ? OR LOWER(COALESCE(l.detail,'')) LIKE ?)")
+        params.extend([like,like,like,like])
+    sql=base+(" WHERE "+" AND ".join(where) if where else "")+" ORDER BY l.id DESC LIMIT 5000"
+    rows=c.execute(sql,tuple(params)).fetchall()
+    users=[]
+    if u['role']=='admin':
+        users=[dict(x) for x in c.execute("SELECT id,username FROM users WHERE role='hr' ORDER BY username").fetchall()]
+    c.commit(); c.close()
+    result=[dict(r) for r in rows]
+    # Keep the existing array response contract; the frontend loads the user list separately from /admin/users.
+    return result
+
 app.mount('/static',StaticFiles(directory=BASE/'static'),name='static')

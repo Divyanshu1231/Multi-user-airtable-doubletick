@@ -589,6 +589,23 @@ def _find_provider_message_id(value):
             if found: return found
     return ''
 
+def _is_frequency_capping(value):
+    """Recognize provider errors that explicitly indicate WhatsApp frequency capping."""
+    if isinstance(value, (dict, list)):
+        raw = json.dumps(value, ensure_ascii=False, default=str)
+    else:
+        raw = str(value or '')
+    text = raw.lower().replace('-', ' ').replace('_', ' ')
+    markers = (
+        'frequency capping', 'frequency cap', 'frequency limit',
+        'message frequency', 'recipient frequency limit',
+        'too many messages to this recipient', 'too many messages to the recipient',
+        'recipient has reached the limit', 'recipient reached the limit',
+        'healthy ecosystem engagement', '131049', 'marketing message limit',
+    )
+    return any(marker in text for marker in markers)
+
+
 def _find_provider_status(value):
     if isinstance(value, dict):
         status=str(value.get('status') or value.get('messageStatus') or '').strip().upper()
@@ -892,7 +909,9 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
             return {'ok': True, 'ignored': True, 'reason': 'Unsupported or missing status'}
         recipient = re.sub(r'\D', '', str(event_data.get('to') or event_data.get('recipient') or ''))
         detail = str(event_data.get('failMessage') or event_data.get('errorMessage') or
-                     f'DoubleTick status update: {status}')[:1500]
+                     event_data.get('error') or f'DoubleTick status update: {status}')[:1500]
+        if status == 'FAILED' and _is_frequency_capping(event_data):
+            status = 'FREQUENCY_CAPPING'
         c = db()
         target = None
         try:
@@ -904,7 +923,7 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
             if not target and recipient:
                 candidates = c.execute(
                     "SELECT id,phone,status FROM logs "
-                    "WHERE status IN ('PROCESSING','ENQUEUED','SENT','UNKNOWN') "
+                    "WHERE status IN ('PROCESSING','ENQUEUED','SENT','UNKNOWN','FREQUENCY_CAPPING') "
                     "ORDER BY id DESC LIMIT 200"
                 ).fetchall()
                 for candidate in candidates:
@@ -976,7 +995,8 @@ def send(x:SendIn,u=Depends(current_user)):
             provider_id=_find_provider_message_id(response)
             provider_status,provider_error=_find_provider_status(response)
             if provider_status=='FAILED':
-                status='FAILED'; detail=provider_error or json.dumps(response,ensure_ascii=False)[:1500]
+                detail=provider_error or json.dumps(response,ensure_ascii=False)[:1500]
+                status='FREQUENCY_CAPPING' if _is_frequency_capping(response) else 'FAILED'
             elif provider_status in ('SENT','DELIVERED','READ','ENQUEUED'):
                 status=provider_status; detail=json.dumps(response,ensure_ascii=False)[:1500]
             else:
@@ -984,10 +1004,12 @@ def send(x:SendIn,u=Depends(current_user)):
                 status='ENQUEUED'; detail=json.dumps(response,ensure_ascii=False)[:1500]
         except Exception as e:
             detail=str(e)[:1500]
+            if _is_frequency_capping(detail):
+                status='FREQUENCY_CAPPING'
         # Commit each candidate immediately. A later timeout/restart must not roll back earlier results.
         current=c.execute('SELECT status FROM logs WHERE id=?',(log_id,)).fetchone()
         current_status=str(current['status'] or '') if current else ''
-        final_states=('SENT','DELIVERED','READ','FAILED')
+        final_states=('SENT','DELIVERED','READ','FAILED','FREQUENCY_CAPPING')
         if current_status not in final_states:
             c.execute('UPDATE logs SET status=?,detail=?,provider_message_id=?,status_updated_at=CURRENT_TIMESTAMP WHERE id=?',(status,detail,provider_id,log_id))
         elif provider_id:
@@ -995,7 +1017,7 @@ def send(x:SendIn,u=Depends(current_user)):
         c.commit()
         results.append({'name':str(f.get('name') or ''),'status':current_status if current_status in final_states else status,'detail':detail,'message_id':provider_id})
     c.close()
-    return {'ok':True,'summary':{'total':len(results),'sent':sum(z['status'] in ('SENT','DELIVERED','READ','ENQUEUED') for z in results),'failed':sum(z['status']=='FAILED' for z in results),'enqueued':sum(z['status']=='ENQUEUED' for z in results)},'results':results}
+    return {'ok':True,'summary':{'total':len(results),'sent':sum(z['status'] in ('SENT','DELIVERED','READ','ENQUEUED') for z in results),'failed':sum(z['status']=='FAILED' for z in results),'frequency_capping':sum(z['status']=='FREQUENCY_CAPPING' for z in results),'enqueued':sum(z['status']=='ENQUEUED' for z in results)},'results':results}
 
 
 def _reply_e164(value):
@@ -1299,8 +1321,15 @@ def history(status: str = '', user_id: int = 0, from_date: str = '', to_date: st
         base = "SELECT l.*,? AS username FROM logs l"
         params.append(u['username'])
         where.append("l.user_id=?"); params.append(u['id'])
+    visible_history_statuses = ('SENT', 'DELIVERED', 'READ', 'FREQUENCY_CAPPING')
     if status:
-        where.append("UPPER(COALESCE(l.status,''))=?"); params.append(status.strip().upper())
+        normalized_status = status.strip().upper()
+        if normalized_status not in visible_history_statuses:
+            c.close()
+            return []
+        where.append("UPPER(COALESCE(l.status,''))=?"); params.append(normalized_status)
+    else:
+        where.append("UPPER(COALESCE(l.status,'')) IN ('SENT','DELIVERED','READ','FREQUENCY_CAPPING')")
     if from_date:
         where.append("DATE(l.created_at)>=DATE(?)"); params.append(from_date)
     if to_date:

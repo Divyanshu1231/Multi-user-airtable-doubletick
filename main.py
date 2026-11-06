@@ -195,8 +195,82 @@ class CsvPreviewIn(BaseModel): upload_id:str
 class CsvSendIn(BaseModel): upload_id:str; candidate_ids:list[str]; template_name:str; language:str='en'; confirm_opt_in:bool=False
 class ChatReplyIn(BaseModel): message:str=Field(min_length=1,max_length=4000)
 
+
+# ---- Pull-based delivery status sync (backup for missed/late webhooks) ----
+_STATUS_RANK={'PROCESSING':0,'ENQUEUED':1,'UNKNOWN':1,'SENT':2,'DELIVERED':3,'READ':4}
+_sync_lock=threading.Lock()
+_sync_last_try={}
+
+def sync_pending_statuses(user_id=None, limit=15):
+    """Ask DoubleTick (GET /whatsapp/message/status) for messages still stuck in
+    ENQUEUED/SENT/UNKNOWN and update logs. API limit is 1 request/second."""
+    if not _sync_lock.acquire(blocking=False):
+        return {'checked':0,'updated':0,'busy':True}
+    checked=updated=0
+    try:
+        key=os.getenv('DOUBLETICK_API_KEY','').strip()
+        if not key: return {'checked':0,'updated':0,'error':'DOUBLETICK_API_KEY missing'}
+        c=db()
+        try:
+            sql="SELECT id,status,provider_message_id FROM logs WHERE UPPER(COALESCE(status,'')) IN ('ENQUEUED','UNKNOWN','SENT') AND COALESCE(provider_message_id,'')<>''"
+            params=[]
+            if user_id:
+                sql+=" AND user_id=?"; params.append(user_id)
+            rows=c.execute(sql+" ORDER BY id DESC LIMIT 300",tuple(params)).fetchall()
+            for r in rows:
+                if checked>=limit: break
+                lid=r['id']; pid=str(r['provider_message_id'] or '').strip()
+                if not re.fullmatch(r'[0-9a-fA-F-]{36}',pid): continue
+                if time.time()-_sync_last_try.get(lid,0)<300: continue
+                _sync_last_try[lid]=time.time(); checked+=1
+                try:
+                    resp=requests.get('https://public.doubletick.io/whatsapp/message/status',
+                                      headers={'Authorization':key,'Accept':'application/json'},
+                                      params={'messageId':pid},timeout=15)
+                except Exception:
+                    time.sleep(1.1); continue
+                if resp.status_code==429: break
+                if resp.status_code!=200:
+                    time.sleep(1.1); continue
+                try: d=resp.json()
+                except Exception: d={}
+                new=None; detail=''
+                if d.get('failedAt'):
+                    new='FAILED'; detail=str(d.get('failedReason') or d.get('errorCode') or 'Message failed')[:1500]
+                    if _is_frequency_capping(detail) or str(d.get('errorCode') or '')=='131049':
+                        new='FREQUENCY_CAPPING'
+                elif d.get('readAt'): new='READ'
+                elif d.get('deliveredAt'): new='DELIVERED'
+                elif d.get('sentAt'): new='SENT'
+                old=str(r['status'] or '').upper()
+                if new and new!=old and (new in ('FAILED','FREQUENCY_CAPPING') or _STATUS_RANK.get(new,0)>_STATUS_RANK.get(old,0)):
+                    c.execute("UPDATE logs SET status=?,detail=?,status_updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                              (new, detail or 'DoubleTick status update: '+new, lid))
+                    c.commit(); updated+=1
+                time.sleep(1.1)
+        finally:
+            c.close()
+    except Exception:
+        import logging
+        logging.getLogger("uvicorn.error").exception("DoubleTick status sync failed")
+    finally:
+        _sync_lock.release()
+    return {'checked':checked,'updated':updated}
+
+def _status_sync_loop():
+    time.sleep(20)
+    while True:
+        try: sync_pending_statuses(None,limit=20)
+        except Exception: pass
+        time.sleep(60)
+
+@app.post('/api/history/sync-status')
+def history_sync_status(u=Depends(current_user)):
+    return sync_pending_statuses(None if u['role']=='admin' else u['id'],limit=15)
+
 @app.on_event('startup')
 def startup():
+    threading.Thread(target=_status_sync_loop,daemon=True).start()
     # ADMIN_USERNAME / ADMIN_PASSWORD are the authoritative bootstrap credentials.
     # Existing HR users, templates, settings, logs and chats are never deleted.
     c=db()

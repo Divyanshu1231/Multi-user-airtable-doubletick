@@ -133,8 +133,18 @@ async function deleteTemplate(id){if(confirm('Delete this template?')){await api
 async function chatsPage(){
  if(chatRefreshTimer){clearInterval(chatRefreshTimer);chatRefreshTimer=null}
  let a=await api('/chats');
- $('view').innerHTML=`<div class="heading"><div><h1>WhatsApp Chats</h1><div class="muted">Live candidate conversations. Replies refresh automatically.</div></div><button class="btn secondary" onclick="refreshChats()">↻ Refresh</button></div><div class="card"><div class="grid" style="grid-template-columns:280px 1fr;align-items:start"><div><div class="field"><label>Search candidate / mobile</label><input id="chatSearch" placeholder="Search…" oninput="filterChatList()"></div><div id="chatlist" style="max-height:70vh;overflow:auto">${chatListHtml(a)}</div></div><div id="chatdetail" class="muted">Select a candidate to open conversation.</div></div></div>`;
+ $('view').innerHTML=`<div class="heading"><div><h1>WhatsApp Chats</h1><div class="muted">Live candidate conversations. Replies refresh automatically.</div></div><div class="row"><button class="btn secondary ${me.role==='admin'?'':'hidden'}" onclick="backfillChats()">⬇ Import old replies</button><button class="btn secondary" onclick="refreshChats()">↻ Refresh</button></div></div><div class="card"><div class="grid" style="grid-template-columns:280px 1fr;align-items:start"><div><div class="field"><label>Search candidate / mobile</label><input id="chatSearch" placeholder="Search…" oninput="filterChatList()"></div><div id="chatlist" style="max-height:70vh;overflow:auto">${chatListHtml(a)}</div></div><div id="chatdetail" class="muted">Select a candidate to open conversation.</div></div></div>`;
  chatRefreshTimer=setInterval(()=>refreshChats().catch(e=>console.warn(e)),10000);
+}
+async function backfillChats(){
+ const d=prompt('Pichhle kitne din ke replies import karne hain? (1-90)','30');if(!d)return;
+ try{
+  let r=await api('/chats/backfill?days='+encodeURIComponent(d),{method:'POST'});
+  const btn=document.querySelector('button[onclick="backfillChats()"]');
+  const poll=async()=>{let s=await api('/chats-backfill-status');if(btn)btn.textContent='Importing '+s.done+'/'+s.total+' · new '+s.inserted;
+   if(s.running){setTimeout(poll,3000)}else{if(btn)btn.textContent='⬇ Import old replies';alert('Import complete. New replies: '+s.inserted+', already present: '+s.skipped_existing+', not found: '+s.not_found+', errors: '+s.errors+(s.last_error?'\nLast error: '+s.last_error:''));refreshChats().catch(()=>{})}};
+  poll();
+ }catch(e){alert(e.message)}
 }
 async function refreshChats(){
  api('/history/sync-status',{method:'POST'}).catch(()=>{});

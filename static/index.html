@@ -144,6 +144,38 @@ async function refreshChats(){
 function chatListHtml(a){return a.map(x=>`<div class="nav chatitem ${Number(x.unread_count||0)>0?'unread-chat':''}" style="border-bottom:1px solid #edf0f4;cursor:pointer" data-phone="${esc(x.phone)}" data-search="${esc((x.candidate_name||'')+' '+(x.phone||'')).toLowerCase()}" onclick="openChat('${esc(x.phone)}','${esc(x.candidate_name||x.phone)}')"><b>${esc(x.candidate_name||x.phone)}</b>${Number(x.unread_count||0)>0?`<span class="unread-badge">NEW REPLY · ${Number(x.unread_count)}</span>`:''}<div class="small muted">${esc(x.phone)} · ${x.message_count||0} messages</div><div class="small muted">${esc(x.last_at||'')}</div></div>`).join('')||'<p class="muted">No conversations yet. Confirm DoubleTick MESSAGE_RECEIVED webhook configuration.</p>'}
 function filterChatList(){let q=($('chatSearch')?.value||'').toLowerCase();document.querySelectorAll('.chatitem').forEach(x=>x.classList.toggle('hidden',!x.dataset.search.includes(q)))}
 async function openChat(phone,name){activeChatPhone=phone;activeChatName=name;await renderChat(phone,name)}
+
+function chatProviderReason(detail){
+ if(!detail)return '';
+ let parsed=null;
+ try{parsed=JSON.parse(String(detail))}catch(_){}
+ if(parsed){
+  const keys=['failMessage','failureReason','errorMessage','error_description','description','reason'];
+  const walk=v=>{if(!v||typeof v!=='object')return '';for(const k of keys){if(v[k]&&typeof v[k]==='string')return v[k]}for(const child of Object.values(v)){const found=walk(child);if(found)return found}return ''};
+  return walk(parsed);
+ }
+ const raw=String(detail).trim();
+ if(raw.startsWith('{')||raw.startsWith('['))return '';
+ return raw.length>500?raw.slice(0,500)+'…':raw;
+}
+function chatMessageHtml(x){
+ const incoming=x.direction==='IN', st=String(x.status||'').toUpperCase();
+ const labels={ENQUEUED:'Queued · awaiting delivery update',PROCESSING:'Processing',SENT:'Sent',DELIVERED:'Delivered',READ:'Read',FAILED:'Delivery failed',FREQUENCY_CAPPING:'⚠ Message not delivered due to frequency capping'};
+ const colors={ENQUEUED:'#64748b',PROCESSING:'#64748b',SENT:'#1d4ed8',DELIVERED:'#15803d',READ:'#15803d',FAILED:'#b91c1c',FREQUENCY_CAPPING:'#b45309'};
+ let content=String(x.content||'');
+ if(!incoming && /^(CSV:\s*)/i.test(content))content=content.replace(/^CSV:\s*/i,'');
+ if(!incoming && ['CSV','APPROVED','WEBHOOK_RECONCILED','APPROVED'].includes(String(x.message_type||'').toUpperCase())){
+   content='Template: '+(content||'WhatsApp template');
+ }
+ if(!content)content='['+(x.message_type||'MESSAGE')+']';
+ const reason=chatProviderReason(x.detail);
+ const showReason=!!reason && (st==='FAILED'||st==='FREQUENCY_CAPPING');
+ const fallbackReason=st==='FREQUENCY_CAPPING'&&!reason?'Meta blocked this marketing message because of WhatsApp frequency capping (error 131049).':'';
+ const statusHtml=st?`<div class="small" style="margin-top:7px;color:${colors[st]||'#475569'};font-weight:700">${esc(labels[st]||st)}</div>`:'';
+ const reasonHtml=(showReason||fallbackReason)?`<div class="small" style="margin-top:4px;color:#7c2d12;white-space:pre-wrap">${esc(reason||fallbackReason)}</div>`:'';
+ return `<div style="display:flex;justify-content:${incoming?'flex-start':'flex-end'};margin:9px 0"><div style="max-width:78%;padding:10px 13px;border-radius:12px;background:${incoming?'#fff':'#dbeafe'};border:1px solid #e5e7eb"><div class="small muted">${incoming?'Candidate':'You'} · ${esc(x.created_at||'')}</div><div style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(content)}</div>${x.media_url?`<a target="_blank" rel="noopener" href="${esc(x.media_url)}">Open ${esc(x.message_type||'media')}</a>`:''}${statusHtml}${reasonHtml}</div></div>`;
+}
+
 async function renderChat(phone,name){
  // Preserve the unsent draft while the 10-second inbox refresh updates the conversation.
  const oldField=$('chatReplyText');
@@ -153,7 +185,7 @@ async function renderChat(phone,name){
  const selectionEnd=oldField && typeof oldField.selectionEnd==='number' ? oldField.selectionEnd : draft.length;
  try{await api('/chats/'+encodeURIComponent(phone)+'/read',{method:'POST'})}catch(e){console.warn('Mark read:',e.message)}
  let a=await api('/chats/'+encodeURIComponent(phone)),box=$('chatdetail');if(!box)return;
- box.innerHTML=`<div class="row" style="justify-content:space-between"><div><h3 style="margin:0">${esc(name)}</h3><div class="muted small">${esc(phone)}</div></div><button class="btn secondary" onclick="renderChat('${esc(phone)}','${esc(name)}')">↻</button></div><div id="chatmessages" style="height:52vh;overflow:auto;background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:14px;margin-top:12px">${a.map(x=>`<div style="display:flex;justify-content:${x.direction==='IN'?'flex-start':'flex-end'};margin:9px 0"><div style="max-width:78%;padding:10px 13px;border-radius:12px;background:${x.direction==='IN'?'#fff':'#dbeafe'};border:1px solid #e5e7eb"><div class="small muted">${x.direction==='IN'?'Candidate':'You'} · ${esc(x.created_at||'')}</div><div style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(x.content||'['+(x.message_type||'MESSAGE')+']')}</div>${x.media_url?`<a target="_blank" rel="noopener" href="${esc(x.media_url)}">Open ${esc(x.message_type||'media')}</a>`:''}${x.status?`<div class="small" style="margin-top:5px;color:${String(x.status).toUpperCase()==='FREQUENCY_CAPPING'?'#b45309':String(x.status).toUpperCase()==='FAILED'?'#b91c1c':'#475569'};font-weight:600">${esc(String(x.status).toUpperCase()==='FREQUENCY_CAPPING'?'⚠ Frequency Capping':String(x.status).toUpperCase()==='ENQUEUED'?'Queued':x.status)}</div>${x.detail?`<div class="small muted">${esc(x.detail)}</div>`:''}`:''}</div></div>`).join('')||'<p class="muted">No messages saved for this candidate yet. Incoming messages appear after DoubleTick sends the MESSAGE_RECEIVED webhook.</p>'}</div><div style="display:flex;gap:8px;margin-top:10px"><textarea id="chatReplyText" rows="2" maxlength="4000" placeholder="Type a WhatsApp reply…" style="flex:1;resize:vertical;border:1px solid #d6dce6;border-radius:9px;padding:11px;font:inherit" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChatReply()}"></textarea><button class="btn" id="chatSendBtn" onclick="sendChatReply()">Send</button></div><div class="small muted" style="margin-top:7px">Free-form text replies work only within WhatsApp's 24-hour customer service window after the candidate's last message. Outside that window, send an approved template.</div><div class="internal-notes"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Internal Notes (Recruiter / Team Member)</h3><span class="small muted">Not sent to WhatsApp</span></div><textarea id="internalNoteText" rows="2" maxlength="3000" placeholder="Example: Candidate se baat ho gayi; salary discuss kar li." style="width:100%;margin-top:9px;box-sizing:border-box;border:1px solid #d6dce6;border-radius:8px;padding:10px;font:inherit"></textarea><div class="row" style="justify-content:flex-end;margin-top:7px"><button class="btn secondary" onclick="saveInternalNote()">Save internal note</button></div><div id="internalNotesList" class="small muted" style="margin-top:10px">Loading notes…</div></div>`;
+ box.innerHTML=`<div class="row" style="justify-content:space-between"><div><h3 style="margin:0">${esc(name)}</h3><div class="muted small">${esc(phone)}</div></div><button class="btn secondary" onclick="renderChat('${esc(phone)}','${esc(name)}')">↻</button></div><div id="chatmessages" style="height:52vh;overflow:auto;background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:14px;margin-top:12px">${a.map(chatMessageHtml).join('')||'<p class="muted">No messages saved for this candidate yet. Incoming messages appear after DoubleTick sends the MESSAGE_RECEIVED webhook.</p>'}</div><div style="display:flex;gap:8px;margin-top:10px"><textarea id="chatReplyText" rows="2" maxlength="4000" placeholder="Type a WhatsApp reply…" style="flex:1;resize:vertical;border:1px solid #d6dce6;border-radius:9px;padding:11px;font:inherit" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChatReply()}"></textarea><button class="btn" id="chatSendBtn" onclick="sendChatReply()">Send</button></div><div class="small muted" style="margin-top:7px">Free-form text replies work only within WhatsApp's 24-hour customer service window after the candidate's last message. Outside that window, send an approved template.</div><div class="internal-notes"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Internal Notes (Recruiter / Team Member)</h3><span class="small muted">Not sent to WhatsApp</span></div><textarea id="internalNoteText" rows="2" maxlength="3000" placeholder="Example: Candidate se baat ho gayi; salary discuss kar li." style="width:100%;margin-top:9px;box-sizing:border-box;border:1px solid #d6dce6;border-radius:8px;padding:10px;font:inherit"></textarea><div class="row" style="justify-content:flex-end;margin-top:7px"><button class="btn secondary" onclick="saveInternalNote()">Save internal note</button></div><div id="internalNotesList" class="small muted" style="margin-top:10px">Loading notes…</div></div>`;
  loadInternalNotes(phone);
  const newField=$('chatReplyText');
  if(newField){

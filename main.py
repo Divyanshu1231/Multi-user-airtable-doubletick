@@ -69,6 +69,7 @@ def db():
         if 'is_read' not in chat_cols: c.execute("ALTER TABLE chat_messages ADD COLUMN is_read INTEGER NOT NULL DEFAULT 0")
         c.execute("CREATE TABLE IF NOT EXISTS internal_notes(id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, phone TEXT NOT NULL, note TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         c.execute("CREATE TABLE IF NOT EXISTS logs(id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, candidate_name TEXT, phone TEXT, kind TEXT, template_name TEXT, status TEXT, detail TEXT, provider_message_id TEXT DEFAULT '', status_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        c.execute("CREATE TABLE IF NOT EXISTS doubletick_webhook_events(id BIGSERIAL PRIMARY KEY, event_type TEXT DEFAULT '', provider_message_id TEXT DEFAULT '', recipient_phone TEXT DEFAULT '', provider_status TEXT DEFAULT '', normalized_status TEXT DEFAULT '', detail TEXT DEFAULT '', payload_json TEXT DEFAULT '', matched_log_id BIGINT, processing_result TEXT DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         log_cols={r['name'] for r in c.execute("SELECT column_name AS name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='logs'").fetchall()}
         for col,ddl in {'provider_message_id':"TEXT DEFAULT ''",'status_updated_at':"TIMESTAMP DEFAULT CURRENT_TIMESTAMP"}.items():
             if col not in log_cols: c.execute(f'ALTER TABLE logs ADD COLUMN {col} {ddl}')
@@ -85,6 +86,7 @@ def db():
     if 'is_read' not in chat_cols: c.execute("ALTER TABLE chat_messages ADD COLUMN is_read INTEGER NOT NULL DEFAULT 0")
     c.execute("CREATE TABLE IF NOT EXISTS internal_notes(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, phone TEXT NOT NULL, note TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
     c.execute("CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, candidate_name TEXT, phone TEXT, kind TEXT, template_name TEXT, status TEXT, detail TEXT, provider_message_id TEXT DEFAULT '', status_updated_at TEXT DEFAULT CURRENT_TIMESTAMP, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+    c.execute("CREATE TABLE IF NOT EXISTS doubletick_webhook_events(id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT DEFAULT '', provider_message_id TEXT DEFAULT '', recipient_phone TEXT DEFAULT '', provider_status TEXT DEFAULT '', normalized_status TEXT DEFAULT '', detail TEXT DEFAULT '', payload_json TEXT DEFAULT '', matched_log_id INTEGER, processing_result TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
     existing_logs={r['name'] for r in c.execute('PRAGMA table_info(logs)').fetchall()}
     for col,ddl in {'provider_message_id':"TEXT DEFAULT ''",'status_updated_at':"TEXT DEFAULT CURRENT_TIMESTAMP"}.items():
         if col not in existing_logs: c.execute(f'ALTER TABLE logs ADD COLUMN {col} {ddl}')
@@ -893,8 +895,8 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
         return {'ok': True, 'event': 'TEMPLATE_STATUS_UPDATE',
                 'template_name': template_name, 'language': language, 'status': status}
 
-    # Outbound delivery/read/failure status events. DoubleTick may wrap fields
-    # inside data/payload/message, so always read recursively from all_objects.
+    # Outbound delivery/read/failure status events. Persist every event so an
+    # unmatched webhook is never silently lost after returning HTTP 200.
     message_id = str(_first_value(('dtMessageId', 'messageId', 'message_id', 'wamid', 'providerMessageId')) or '').strip()
     raw_status = str(_first_value(('status', 'messageStatus', 'deliveryStatus', 'message_status')) or '').strip().upper()
     if not raw_status:
@@ -909,7 +911,8 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
                           'MESSAGE_READ': 'READ', 'MESSAGE_FAILED': 'FAILED'}
         status = status_aliases.get(raw_status, raw_status)
         if status not in ('SENT', 'DELIVERED', 'READ', 'FAILED', 'ENQUEUED', 'PROCESSING'):
-            logger.info("DoubleTick status event acknowledged but ignored: event=%s status=%s", event, raw_status or 'MISSING')
+            logger.info("DoubleTick status event unsupported: event=%s status=%s message_id_present=%s",
+                        event, raw_status or 'MISSING', bool(message_id))
             return {'ok': True, 'ignored': True, 'reason': 'Unsupported or missing status', 'provider_status': raw_status}
 
         recipient_value = _first_value(('to', 'recipient', 'recipientPhone', 'recipient_phone',
@@ -923,40 +926,110 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
         frequency_capping = _is_frequency_capping(event_data) or _is_frequency_capping(detail)
         if status == 'FAILED' and frequency_capping:
             status = 'FREQUENCY_CAPPING'
-            if not detail:
+            if not failure_detail:
                 detail = 'Message not delivered due to frequency capping (Meta error 131049).'
 
+        # Provider payloads vary: preserve useful candidate/template metadata for
+        # fallback rows and for support diagnostics.
+        candidate_name = str(_first_value(('customerName', 'customer_name', 'candidateName', 'candidate_name', 'profileName', 'name')) or '').strip()[:200]
+        template_value = _first_value(('templateName', 'template_name', 'nameOfTemplate'))
+        if not template_value:
+            template_obj = _first_value(('templateMessage', 'template'))
+            if isinstance(template_obj, dict):
+                template_value = template_obj.get('name') or template_obj.get('templateName')
+        template_name = str(template_value or 'DoubleTick webhook status')[:200]
         c = db()
         target = None
+        result_kind = 'unmatched'
         try:
+            # Exact provider message ID is always the strongest key.
             if message_id:
                 target = c.execute(
-                    'SELECT id,status FROM logs WHERE provider_message_id=? ORDER BY id DESC LIMIT 1',
+                    'SELECT id,user_id,candidate_name,phone,status FROM logs WHERE provider_message_id=? ORDER BY id DESC LIMIT 1',
                     (message_id,)
                 ).fetchone()
-            # Some DoubleTick webhook configurations return a different ID from
-            # the send API. Fall back to the newest matching recipient record.
-            if not target and recipient:
+
+            # DoubleTick can send a different ID in the status callback than the
+            # initial send response. Match the most recent record for this phone,
+            # preferring an attempt that is still awaiting a final status.
+            if not target and recipient and len(recipient) >= 10:
                 candidates = c.execute(
-                    "SELECT id,phone,status FROM logs ORDER BY id DESC LIMIT 2000"
+                    "SELECT id,user_id,candidate_name,phone,status,created_at FROM logs ORDER BY id DESC LIMIT 5000"
                 ).fetchall()
+                same_phone = []
                 for candidate in candidates:
                     digits = re.sub(r'\D', '', str(candidate['phone'] or ''))
-                    if digits and recipient and digits[-10:] == recipient[-10:]:
-                        target = candidate
-                        break
+                    if digits and digits[-10:] == recipient[-10:]:
+                        same_phone.append(candidate)
+                pending = next((x for x in same_phone if str(x['status'] or '').upper() in ('PROCESSING','ENQUEUED','UNKNOWN','SENT')), None)
+                target = pending or (same_phone[0] if same_phone else None)
+
+            # Do not downgrade a confirmed delivery/read due to an older or
+            # duplicated failure callback. Frequency capping can replace queued
+            # or sent states, but never a confirmed DELIVERED/READ state.
+            saved_status = status
             if target:
-                c.execute(
-                    'UPDATE logs SET status=?,detail=?,status_updated_at=CURRENT_TIMESTAMP WHERE id=?',
-                    (status, detail, target['id'])
-                )
-                c.commit()
-            logger.info("DoubleTick status processed provider_status=%s saved_status=%s matched=%s message_id_present=%s recipient_last4=%s",
-                        raw_status, status, bool(target), bool(message_id), recipient[-4:])
+                old_status = str(target['status'] or '').upper()
+                if old_status in ('DELIVERED', 'READ') and status in ('FAILED', 'FREQUENCY_CAPPING', 'ENQUEUED', 'PROCESSING', 'SENT'):
+                    saved_status = old_status
+                    result_kind = 'matched_ignored_downgrade'
+                else:
+                    c.execute(
+                        'UPDATE logs SET status=?,detail=?,provider_message_id=CASE WHEN COALESCE(provider_message_id,\'\')=\'\' AND ?<>\'\' THEN ? ELSE provider_message_id END,status_updated_at=CURRENT_TIMESTAMP WHERE id=?',
+                        (saved_status, detail, message_id, message_id, target['id'])
+                    )
+                    result_kind = 'matched_updated'
+                log_id = target['id']
+            else:
+                log_id = None
+                # If the original attempt cannot be found, create a visible
+                # reconciliation row rather than returning 200 and losing the
+                # recipient/status. Assign it to the phone's latest owner; if no
+                # owner exists, assign it to the first admin account.
+                if recipient and len(recipient) >= 10:
+                    owner = None
+                    for candidate in c.execute("SELECT user_id,phone,candidate_name FROM logs ORDER BY id DESC LIMIT 5000").fetchall():
+                        digits = re.sub(r'\D', '', str(candidate['phone'] or ''))
+                        if digits and digits[-10:] == recipient[-10:]:
+                            owner = candidate
+                            break
+                    if owner:
+                        owner_id = owner['user_id']
+                        if not candidate_name:
+                            candidate_name = str(owner['candidate_name'] or '')[:200]
+                    else:
+                        admin_row = c.execute("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1").fetchone()
+                        fallback_user = admin_row or c.execute("SELECT id FROM users ORDER BY id LIMIT 1").fetchone()
+                        owner_id = fallback_user['id'] if fallback_user else None
+                    if owner_id is not None:
+                        cur = c.execute(
+                            "INSERT INTO logs(user_id,candidate_name,phone,kind,template_name,status,detail,provider_message_id,status_updated_at) VALUES(?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+                            (owner_id, candidate_name or recipient, recipient, 'webhook_reconciled', template_name, status, detail, message_id)
+                        )
+                        log_id = cur.lastrowid
+                        result_kind = 'reconciliation_row_created'
+
+            # Store event audit record. Payload is bounded to keep DB rows sane.
+            payload_text = json.dumps(payload, ensure_ascii=False, default=str)[:12000]
+            c.execute(
+                "INSERT INTO doubletick_webhook_events(event_type,provider_message_id,recipient_phone,provider_status,normalized_status,detail,payload_json,matched_log_id,processing_result) VALUES(?,?,?,?,?,?,?,?,?)",
+                (event or 'UNKNOWN', message_id, recipient, raw_status, saved_status if target else status,
+                 detail, payload_text, log_id, result_kind)
+            )
+            c.commit()
+            logger.info("DoubleTick status processed event=%s provider_status=%s saved_status=%s result=%s log_id=%s message_id_present=%s recipient_last4=%s",
+                        event or 'UNKNOWN', raw_status, saved_status if target else status,
+                        result_kind, log_id, bool(message_id), recipient[-4:])
+        except Exception:
+            c.rollback()
+            logger.exception("DoubleTick status event database processing failed event=%s status=%s message_id_present=%s recipient_last4=%s",
+                             event or 'UNKNOWN', raw_status, bool(message_id), recipient[-4:])
+            raise HTTPException(500, 'Could not persist DoubleTick status event')
         finally:
             c.close()
         return {'ok': True, 'event': 'MESSAGE_STATUS_UPDATE', 'matched': bool(target),
-                'status': status, 'provider_status': raw_status, 'message_id': message_id,
+                'saved_record': bool(log_id), 'result': result_kind, 'status': saved_status if target else status,
+                'provider_status': raw_status, 'message_id': message_id,
                 'recipient_last4': recipient[-4:]}
 
     logger.info("DoubleTick unsupported event acknowledged: event=%s keys=%s",

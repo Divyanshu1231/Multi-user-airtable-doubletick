@@ -893,25 +893,39 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
         return {'ok': True, 'event': 'TEMPLATE_STATUS_UPDATE',
                 'template_name': template_name, 'language': language, 'status': status}
 
-    # Outbound delivery/read/failure status events.
+    # Outbound delivery/read/failure status events. DoubleTick may wrap fields
+    # inside data/payload/message, so always read recursively from all_objects.
+    message_id = str(_first_value(('dtMessageId', 'messageId', 'message_id', 'wamid', 'providerMessageId')) or '').strip()
+    raw_status = str(_first_value(('status', 'messageStatus', 'deliveryStatus', 'message_status')) or '').strip().upper()
+    if not raw_status:
+        raw_status = {'MESSAGE_SENT': 'SENT', 'MESSAGE_DELIVERED': 'DELIVERED',
+                      'MESSAGE_READ': 'READ', 'MESSAGE_FAILED': 'FAILED'}.get(event, '')
     is_status_event = event in ('MESSAGE_STATUS_UPDATE', 'MESSAGE_STATUS',
-                                'MESSAGE_DELIVERED', 'MESSAGE_READ', 'MESSAGE_FAILED')
-    if is_status_event or (not is_incoming and
-                           (event_data.get('messageId') or event_data.get('dtMessageId'))):
-        message_id = str(event_data.get('dtMessageId') or event_data.get('messageId') or '').strip()
-        status = str(event_data.get('status') or event_data.get('messageStatus') or '').strip().upper()
-        if not status:
-            status = {'MESSAGE_DELIVERED': 'DELIVERED', 'MESSAGE_READ': 'READ',
-                      'MESSAGE_FAILED': 'FAILED'}.get(event, '')
-        if status not in ('SENT', 'DELIVERED', 'READ', 'FAILED'):
-            logger.info("DoubleTick status event acknowledged but ignored: event=%s status=%s",
-                        event, status or 'MISSING')
-            return {'ok': True, 'ignored': True, 'reason': 'Unsupported or missing status'}
-        recipient = re.sub(r'\D', '', str(event_data.get('to') or event_data.get('recipient') or ''))
-        detail = str(event_data.get('failMessage') or event_data.get('errorMessage') or
-                     event_data.get('error') or f'DoubleTick status update: {status}')[:1500]
-        if status == 'FAILED' and _is_frequency_capping(event_data):
+                                'MESSAGE_SENT', 'MESSAGE_DELIVERED', 'MESSAGE_READ', 'MESSAGE_FAILED',
+                                'MESSAGE_STATUS_CHANGED', 'MESSAGES.STATUS')
+    if is_status_event or (not is_incoming and (message_id or raw_status)):
+        status_aliases = {'DELIVERED (DOUBLETICK)': 'DELIVERED', 'DELIVERED_DOUBLETICK': 'DELIVERED',
+                          'MESSAGE_SENT': 'SENT', 'MESSAGE_DELIVERED': 'DELIVERED',
+                          'MESSAGE_READ': 'READ', 'MESSAGE_FAILED': 'FAILED'}
+        status = status_aliases.get(raw_status, raw_status)
+        if status not in ('SENT', 'DELIVERED', 'READ', 'FAILED', 'ENQUEUED', 'PROCESSING'):
+            logger.info("DoubleTick status event acknowledged but ignored: event=%s status=%s", event, raw_status or 'MISSING')
+            return {'ok': True, 'ignored': True, 'reason': 'Unsupported or missing status', 'provider_status': raw_status}
+
+        recipient_value = _first_value(('to', 'recipient', 'recipientPhone', 'recipient_phone',
+                                        'customerPhone', 'customer_phone', 'phoneNumber', 'phone_number', 'mobile')) or ''
+        if isinstance(recipient_value, dict):
+            recipient_value = recipient_value.get('phone') or recipient_value.get('wa_id') or recipient_value.get('number') or recipient_value.get('id') or ''
+        recipient = re.sub(r'\D', '', str(recipient_value))
+        failure_detail = _first_value(('failMessage', 'errorMessage', 'error_description',
+                                       'failureReason', 'reason', 'error', 'description'))
+        detail = str(failure_detail or f'DoubleTick status update: {status}')[:1500]
+        frequency_capping = _is_frequency_capping(event_data) or _is_frequency_capping(detail)
+        if status == 'FAILED' and frequency_capping:
             status = 'FREQUENCY_CAPPING'
+            if not detail:
+                detail = 'Message not delivered due to frequency capping (Meta error 131049).'
+
         c = db()
         target = None
         try:
@@ -920,15 +934,15 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
                     'SELECT id,status FROM logs WHERE provider_message_id=? ORDER BY id DESC LIMIT 1',
                     (message_id,)
                 ).fetchone()
+            # Some DoubleTick webhook configurations return a different ID from
+            # the send API. Fall back to the newest matching recipient record.
             if not target and recipient:
                 candidates = c.execute(
-                    "SELECT id,phone,status FROM logs "
-                    "WHERE status IN ('PROCESSING','ENQUEUED','SENT','UNKNOWN','FREQUENCY_CAPPING') "
-                    "ORDER BY id DESC LIMIT 200"
+                    "SELECT id,phone,status FROM logs ORDER BY id DESC LIMIT 2000"
                 ).fetchall()
                 for candidate in candidates:
                     digits = re.sub(r'\D', '', str(candidate['phone'] or ''))
-                    if digits and digits[-10:] == recipient[-10:]:
+                    if digits and recipient and digits[-10:] == recipient[-10:]:
                         target = candidate
                         break
             if target:
@@ -937,11 +951,13 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
                     (status, detail, target['id'])
                 )
                 c.commit()
-            logger.info("DoubleTick status processed status=%s matched=%s", status, bool(target))
+            logger.info("DoubleTick status processed provider_status=%s saved_status=%s matched=%s message_id_present=%s recipient_last4=%s",
+                        raw_status, status, bool(target), bool(message_id), recipient[-4:])
         finally:
             c.close()
         return {'ok': True, 'event': 'MESSAGE_STATUS_UPDATE', 'matched': bool(target),
-                'status': status, 'message_id': message_id}
+                'status': status, 'provider_status': raw_status, 'message_id': message_id,
+                'recipient_last4': recipient[-4:]}
 
     logger.info("DoubleTick unsupported event acknowledged: event=%s keys=%s",
                 event or 'UNKNOWN', list(event_data.keys())[:30])
@@ -1294,10 +1310,10 @@ def chat_detail(phone:str,u=Depends(current_user)):
     c=db()
     if u['role']=='admin':
         incoming=c.execute('SELECT id,user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id,created_at FROM chat_messages WHERE phone=? ORDER BY id ASC LIMIT 1000',(digits,)).fetchall()
-        outgoing=c.execute("SELECT id,user_id,phone,candidate_name,'OUT' direction,kind message_type,template_name content,'' media_url,provider_message_id,created_at,status FROM logs WHERE REPLACE(REPLACE(REPLACE(phone,'+',''),' ',''),'-','') LIKE ? ORDER BY id ASC LIMIT 1000",('%'+digits[-10:],)).fetchall()
+        outgoing=c.execute("SELECT id,user_id,phone,candidate_name,'OUT' direction,kind message_type,template_name content,'' media_url,provider_message_id,created_at,status,detail FROM logs WHERE REPLACE(REPLACE(REPLACE(phone,'+',''),' ',''),'-','') LIKE ? ORDER BY id ASC LIMIT 1000",('%'+digits[-10:],)).fetchall()
     else:
         incoming=c.execute('SELECT id,user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id,created_at FROM chat_messages WHERE phone=? AND user_id=? ORDER BY id ASC LIMIT 1000',(digits,u['id'])).fetchall()
-        outgoing=c.execute("SELECT id,user_id,phone,candidate_name,'OUT' direction,kind message_type,template_name content,'' media_url,provider_message_id,created_at,status FROM logs WHERE user_id=? AND REPLACE(REPLACE(REPLACE(phone,'+',''),' ',''),'-','') LIKE ? ORDER BY id ASC LIMIT 1000",(u['id'],'%'+digits[-10:])).fetchall()
+        outgoing=c.execute("SELECT id,user_id,phone,candidate_name,'OUT' direction,kind message_type,template_name content,'' media_url,provider_message_id,created_at,status,detail FROM logs WHERE user_id=? AND REPLACE(REPLACE(REPLACE(phone,'+',''),' ',''),'-','') LIKE ? ORDER BY id ASC LIMIT 1000",(u['id'],'%'+digits[-10:])).fetchall()
     items=[dict(x) for x in incoming]+[dict(x) for x in outgoing]
     items.sort(key=lambda x:str(x.get('created_at') or ''))
     c.close(); return items

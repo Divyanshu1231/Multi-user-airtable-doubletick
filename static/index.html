@@ -133,7 +133,8 @@ async function deleteTemplate(id){if(confirm('Delete this template?')){await api
 async function chatsPage(){
  if(chatRefreshTimer){clearInterval(chatRefreshTimer);chatRefreshTimer=null}
  let a=await api('/chats');
- $('view').innerHTML=`<div class="heading"><div><h1>WhatsApp Chats</h1><div class="muted">Live candidate conversations. Replies refresh automatically.</div></div><div class="row"><button class="btn secondary ${me.role==='admin'?'':'hidden'}" onclick="backfillChats()">⬇ Import old replies</button><button class="btn secondary" onclick="refreshChats()">↻ Refresh</button></div></div><div class="card"><div class="grid" style="grid-template-columns:280px 1fr;align-items:start"><div><div class="field"><label>Search candidate / mobile</label><input id="chatSearch" placeholder="Search…" oninput="filterChatList()"></div><div id="chatlist" style="max-height:70vh;overflow:auto">${chatListHtml(a)}</div></div><div id="chatdetail" class="muted">Select a candidate to open conversation.</div></div></div>`;
+ $('view').innerHTML=`<div class="heading"><div><h1>WhatsApp Chats</h1><div class="muted">Live candidate conversations. Replies refresh automatically.</div></div><div class="row"><button class="btn secondary ${me.role==='admin'?'':'hidden'}" onclick="backfillChats()">⬇ Import old replies</button><button class="btn secondary" onclick="refreshChats()">↻ Refresh</button></div></div><div class="card"><div class="grid" style="grid-template-columns:280px 1fr;align-items:start"><div><div class="field"><label>Search candidate / mobile</label><input id="chatSearch" placeholder="Search…" oninput="filterChatList()"></div><div class="row" id="chatFilters" style="gap:8px;margin:-4px 0 10px"><button class="btn secondary" id="cfAll" onclick="setChatFilter('all')">All</button><button class="btn secondary" id="cfUnread" onclick="setChatFilter('unread')">Unread <span id="unreadCount"></span></button></div><div id="chatlist" style="max-height:70vh;overflow:auto">${chatListHtml(a)}</div></div><div id="chatdetail" class="muted">Select a candidate to open conversation.</div></div></div>`;
+ filterChatList();
  chatRefreshTimer=setInterval(()=>refreshChats().catch(e=>console.warn(e)),10000);
 }
 async function backfillChats(){
@@ -152,8 +153,18 @@ async function refreshChats(){
  if(list){list.innerHTML=chatListHtml(a);filterChatList()}
  if(activeChatPhone && $('chatdetail')) await renderChat(activeChatPhone,activeChatName);
 }
-function chatListHtml(a){return a.map(x=>`<div class="nav chatitem ${Number(x.unread_count||0)>0?'unread-chat':''}" style="border-bottom:1px solid #edf0f4;cursor:pointer" data-phone="${esc(x.phone)}" data-search="${esc((x.candidate_name||'')+' '+(x.phone||'')).toLowerCase()}" onclick="openChat('${esc(x.phone)}','${esc(x.candidate_name||x.phone)}')"><b>${esc(x.candidate_name||x.phone)}</b>${Number(x.unread_count||0)>0?`<span class="unread-badge">NEW REPLY · ${Number(x.unread_count)}</span>`:''}<div class="small muted">${esc(x.phone)} · ${x.message_count||0} messages</div><div class="small muted">${esc(x.last_at||'')}</div></div>`).join('')||'<p class="muted">No conversations yet. Confirm DoubleTick MESSAGE_RECEIVED webhook configuration.</p>'}
-function filterChatList(){let q=($('chatSearch')?.value||'').toLowerCase();document.querySelectorAll('.chatitem').forEach(x=>x.classList.toggle('hidden',!x.dataset.search.includes(q)))}
+function chatListHtml(a){return a.map(x=>`<div class="nav chatitem ${Number(x.unread_count||0)>0?'unread-chat':''}" style="border-bottom:1px solid #edf0f4;cursor:pointer" data-phone="${esc(x.phone)}" data-unread="${Number(x.unread_count||0)>0?1:0}" data-search="${esc((x.candidate_name||'')+' '+(x.phone||'')).toLowerCase()}" onclick="openChat('${esc(x.phone)}','${esc(x.candidate_name||x.phone)}')"><b>${esc(x.candidate_name||x.phone)}</b>${Number(x.unread_count||0)>0?`<span class="unread-badge">NEW REPLY · ${Number(x.unread_count)}</span>`:''}<div class="small muted">${esc(x.phone)} · ${x.message_count||0} messages</div><div class="small muted">${esc(x.last_at||'')}</div></div>`).join('')||'<p class="muted">No conversations yet. Confirm DoubleTick MESSAGE_RECEIVED webhook configuration.</p>'}
+let chatFilter='all';
+function setChatFilter(f){chatFilter=f;filterChatList()}
+function filterChatList(){
+ let q=($('chatSearch')?.value||'').toLowerCase(),unread=0;
+ document.querySelectorAll('.chatitem').forEach(x=>{const isU=x.dataset.unread==='1';if(isU)unread++;
+  x.classList.toggle('hidden',!x.dataset.search.includes(q)||(chatFilter==='unread'&&!isU))});
+ const c=$('unreadCount');if(c)c.textContent=unread?'('+unread+')':'';
+ const a=$('cfAll'),u=$('cfUnread');
+ if(a)a.style.cssText=chatFilter==='all'?'background:#2563eb;color:#fff':'';
+ if(u)u.style.cssText=chatFilter==='unread'?'background:#2563eb;color:#fff':'';
+}
 async function openChat(phone,name){activeChatPhone=phone;activeChatName=name;await renderChat(phone,name)}
 
 function chatProviderReason(detail){

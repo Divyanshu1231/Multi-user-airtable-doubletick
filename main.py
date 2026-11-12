@@ -262,6 +262,7 @@ def _status_sync_loop():
     while True:
         try: sync_pending_statuses(None,limit=20)
         except Exception: pass
+        cleanup_old_chats()
         time.sleep(900)
 
 @app.post('/api/history/sync-status')
@@ -269,63 +270,102 @@ def history_sync_status(u=Depends(current_user)):
     return sync_pending_statuses(None if u['role']=='admin' else u['id'],limit=15)
 
 
+# ---- Chat retention: only the last N days of chats are kept (default 7) ----
+CHAT_RETENTION_DAYS=max(1,int(os.getenv('CHAT_RETENTION_DAYS','7') or 7))
+
+def _chat_cutoff():
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc)-timedelta(days=CHAT_RETENTION_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
+
+def cleanup_old_chats():
+    """Delete saved WhatsApp chat messages older than CHAT_RETENTION_DAYS.
+    Message History (logs) and internal notes are not touched."""
+    try:
+        c=db()
+        try:
+            c.execute("DELETE FROM chat_messages WHERE created_at < ?",(_chat_cutoff(),))
+            c.commit()
+        finally:
+            c.close()
+    except Exception:
+        import logging
+        logging.getLogger("uvicorn.error").exception("Old chat cleanup failed")
+
 # ---- Import old customer replies from DoubleTick (backfill) ----
-_backfill_state={'running':False,'total':0,'done':0,'inserted':0,'skipped_existing':0,'not_found':0,'errors':0,'last_error':'','finished':False}
+_backfill_states={}
 _backfill_lock=threading.Lock()
 
-def _run_chat_backfill(days, max_phones):
+def _new_backfill_state():
+    return {'running':False,'total':0,'done':0,'inserted':0,'skipped_existing':0,'not_found':0,'errors':0,'last_error':'','finished':False}
+
+def _run_chat_backfill(days, max_phones, user_id, st):
+    """user_id=None imports for every recruiter (admin); otherwise only chats whose
+    latest owner is that recruiter."""
     from datetime import datetime, timedelta, timezone
-    st=_backfill_state
     key=os.getenv('DOUBLETICK_API_KEY','').strip()
     try:
         waba=dt_sender_number()
     except Exception as exc:
-        st.update(running=False,finished=True,last_error=str(getattr(exc,'detail',exc))); return
+        st.update(running=False,finished=True,last_error=str(getattr(exc,'detail',exc))); _backfill_lock.release(); return
     if not key:
-        st.update(running=False,finished=True,last_error='DOUBLETICK_API_KEY missing'); return
-    start=(datetime.now(timezone.utc)+timedelta(hours=5,minutes=30)-timedelta(days=days)).strftime('%d-%m-%Y')
+        st.update(running=False,finished=True,last_error='DOUBLETICK_API_KEY missing'); _backfill_lock.release(); return
+    now=datetime.now(timezone.utc)
+    start=(now+timedelta(hours=5,minutes=30)-timedelta(days=days)).strftime('%d-%m-%Y')
+    oldest=now-timedelta(days=CHAT_RETENTION_DAYS)
     c=db()
     try:
-        rows=c.execute("SELECT phone,MAX(id) mid FROM logs WHERE COALESCE(phone,'')<>'' GROUP BY phone ORDER BY mid DESC LIMIT ?",(max_phones,)).fetchall()
+        if user_id:
+            rows=c.execute("SELECT phone,MAX(id) mid FROM logs WHERE COALESCE(phone,'')<>'' AND user_id=? GROUP BY phone ORDER BY mid DESC LIMIT ?",(user_id,max_phones)).fetchall()
+        else:
+            rows=c.execute("SELECT phone,MAX(id) mid FROM logs WHERE COALESCE(phone,'')<>'' GROUP BY phone ORDER BY mid DESC LIMIT ?",(max_phones,)).fetchall()
         phones=[]; seen=set()
         for r in rows:
             d=re.sub(r'\D','',str(r['phone'] or ''))
             if len(d)==10: d='91'+d
             if len(d)>=11 and d not in seen: seen.add(d); phones.append(d)
         st['total']=len(phones)
+        owner_sql=("SELECT user_id,candidate_name FROM logs WHERE RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? ORDER BY id DESC LIMIT 1" if DATABASE_URL else
+                   "SELECT user_id,candidate_name FROM logs WHERE substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? ORDER BY id DESC LIMIT 1")
         for d in phones:
             try:
+                owner=c.execute(owner_sql,(d[-10:],)).fetchone()
+                owner_uid=owner['user_id'] if owner else None
+                if user_id and owner_uid!=user_id:
+                    st['done']+=1; continue   # another recruiter owns this chat now
                 resp=requests.get('https://public.doubletick.io/chat-messages',
                                   headers={'Authorization':key,'Accept':'application/json'},
                                   params={'wabaNumber':waba,'customerNumber':d,'startDate':start},timeout=30)
                 if resp.status_code==429:
-                    time.sleep(10); resp=requests.get('https://public.doubletick.io/chat-messages',
-                                  headers={'Authorization':key,'Accept':'application/json'},
-                                  params={'wabaNumber':waba,'customerNumber':d,'startDate':start},timeout=30)
+                    time.sleep(10)
+                    resp=requests.get('https://public.doubletick.io/chat-messages',
+                                      headers={'Authorization':key,'Accept':'application/json'},
+                                      params={'wabaNumber':waba,'customerNumber':d,'startDate':start},timeout=30)
                 if resp.status_code==404: st['not_found']+=1
                 elif resp.status_code not in (200,201):
                     st['errors']+=1; st['last_error']=f'HTTP {resp.status_code}: {resp.text[:200]}'
                 else:
                     data=resp.json()
                     items=data.get('messages') if isinstance(data,dict) else data
-                    owner=c.execute("SELECT user_id,candidate_name FROM logs WHERE RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? ORDER BY id DESC LIMIT 1" if DATABASE_URL else
-                                    "SELECT user_id,candidate_name FROM logs WHERE substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? ORDER BY id DESC LIMIT 1",(d[-10:],)).fetchone()
                     for it in (items or []):
                         if not isinstance(it,dict): continue
                         if str(it.get('messageOriginType') or '').upper()!='CUSTOMER': continue
                         mid=str(it.get('id') or '').strip()
                         m=it.get('message') if isinstance(it.get('message'),dict) else {}
-                        mtype=str(m.get('messageType') or 'TEXT').upper()
-                        media=str(m.get('url') or m.get('mediaUrl') or '')[:2000]
+                        doc=m.get('document') if isinstance(m.get('document'),dict) else {}
+                        mtype=str(m.get('messageType') or m.get('type') or 'TEXT').upper()
+                        media=str(m.get('url') or m.get('mediaUrl') or doc.get('url') or doc.get('link') or '')[:2000]
+                        fname=str(m.get('fileName') or m.get('filename') or doc.get('filename') or doc.get('fileName') or '').strip()
                         text=m.get('text') or m.get('caption') or ''
                         if isinstance(text,dict): text=text.get('body') or json.dumps(text,ensure_ascii=False)
-                        text=str(text or (f'[{mtype}]' if media else f'[{mtype} message]'))[:5000]
-                        ts=it.get('messageTime'); 
-                        try: when=datetime.fromtimestamp(int(ts)/1000,tz=timezone.utc)
-                        except Exception: when=datetime.now(timezone.utc)
+                        text=str(text or '')
+                        if fname: text=(f'📄 {fname}'+('\n'+text if text else ''))
+                        if not text: text=f'[{mtype}]' if media else f'[{mtype} message]'
+                        text=text[:5000]
+                        try: when=datetime.fromtimestamp(int(it.get('messageTime'))/1000,tz=timezone.utc)
+                        except Exception: when=now
+                        if when<oldest: continue   # would be removed by the 7-day cleanup anyway
                         if mid and c.execute("SELECT id FROM chat_messages WHERE provider_message_id=? LIMIT 1",(mid,)).fetchone():
                             st['skipped_existing']+=1; continue
-                        # Same text from same phone within 2 minutes of an already-saved webhook copy = duplicate.
                         dup=False
                         for ex in c.execute("SELECT created_at FROM chat_messages WHERE phone=? AND direction='IN' AND content=?",(d,text)).fetchall():
                             try:
@@ -333,10 +373,10 @@ def _run_chat_backfill(days, max_phones):
                                 if abs((exd.replace(tzinfo=None)-when.replace(tzinfo=None)).total_seconds())<180: dup=True; break
                             except Exception: pass
                         if dup: st['skipped_existing']+=1; continue
-                        is_read=0 if (datetime.now(timezone.utc)-when).total_seconds()<48*3600 else 1
+                        is_read=0 if (now-when).total_seconds()<48*3600 else 1
                         name=str((owner['candidate_name'] if owner else '') or d)[:200]
                         c.execute("INSERT INTO chat_messages(user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id,created_at,is_read) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                                  (owner['user_id'] if owner else None,d,name,'IN',mtype,text,media,mid,when.strftime('%Y-%m-%d %H:%M:%S'),is_read))
+                                  (owner_uid,d,name,'IN',mtype,text,media,mid,when.strftime('%Y-%m-%d %H:%M:%S'),is_read))
                         st['inserted']+=1
                     c.commit()
             except Exception as exc:
@@ -350,21 +390,25 @@ def _run_chat_backfill(days, max_phones):
         _backfill_lock.release()
 
 @app.post('/api/chats/backfill')
-def chats_backfill(days:int=30,max_phones:int=3000,u=Depends(admin)):
-    days=max(1,min(days,90)); max_phones=max(1,min(max_phones,10000))
+def chats_backfill(days:int=7,max_phones:int=3000,u=Depends(current_user)):
+    days=max(1,min(days,CHAT_RETENTION_DAYS)); max_phones=max(1,min(max_phones,10000))
+    key=0 if u['role']=='admin' else u['id']
+    st=_backfill_states.setdefault(key,_new_backfill_state())
     if not _backfill_lock.acquire(blocking=False):
-        return {'ok':True,'already_running':True,**_backfill_state}
-    _backfill_state.update(running=True,finished=False,total=0,done=0,inserted=0,skipped_existing=0,not_found=0,errors=0,last_error='')
-    threading.Thread(target=_run_chat_backfill,args=(days,max_phones),daemon=True).start()
-    return {'ok':True,'started':True,**_backfill_state}
+        return {'ok':True,'already_running':True,'busy_other_user':not st.get('running'),**st}
+    st.clear(); st.update(_new_backfill_state()); st['running']=True
+    threading.Thread(target=_run_chat_backfill,args=(days,max_phones,None if u['role']=='admin' else u['id'],st),daemon=True).start()
+    return {'ok':True,'started':True,**st}
 
 @app.get('/api/chats-backfill-status')
-def chats_backfill_status(u=Depends(admin)):
-    return dict(_backfill_state)
+def chats_backfill_status(u=Depends(current_user)):
+    key=0 if u['role']=='admin' else u['id']
+    return dict(_backfill_states.setdefault(key,_new_backfill_state()))
 
 @app.on_event('startup')
 def startup():
     threading.Thread(target=_status_sync_loop,daemon=True).start()
+    cleanup_old_chats()
     # ADMIN_USERNAME / ADMIN_PASSWORD are the authoritative bootstrap credentials.
     # Existing HR users, templates, settings, logs and chats are never deleted.
     c=db()
@@ -1009,6 +1053,11 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
 
     media_url = str(msg.get('url') or msg.get('mediaUrl') or msg.get('media_url') or
                     msg.get('link') or _first_value(('mediaUrl', 'media_url', 'mediaLink', 'media_link', 'fileUrl')) or '')
+    doc_obj = msg.get('document') if isinstance(msg.get('document'), dict) else {}
+    if not media_url:
+        media_url = str(doc_obj.get('url') or doc_obj.get('link') or '')
+    file_name = str(msg.get('fileName') or msg.get('filename') or msg.get('file_name') or
+                    doc_obj.get('filename') or doc_obj.get('fileName') or '').strip()
     message_type = str(msg.get('type') or msg.get('messageType') or
                        _first_value(('messageType', 'message_type')) or 'TEXT').upper()
     direction = str(_first_value(('direction', 'messageDirection', 'message_direction')) or '').upper()
@@ -1037,6 +1086,8 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
         candidate_name = str(contact.get('name') or customer_obj.get('name') or
                              _first_value(('customerName', 'customer_name', 'profileName', 'pushName', 'name')) or
                              phone_digits)[:200]
+        if file_name:
+            text_value = f'📄 {file_name}' + (f'\n{text_value}' if text_value else '')
         if not text_value:
             text_value = f'[{message_type}]' if media_url else f'[{message_type} message]'
         message_id = str(msg.get('dtMessageId') or msg.get('messageId') or msg.get('id') or
@@ -1582,10 +1633,10 @@ def chats(u=Depends(current_user)):
     c=db()
     if u['role']=='admin':
         rows=c.execute("SELECT phone,MAX(candidate_name) candidate_name,MAX(created_at) last_at,COUNT(*) message_count,SUM(CASE WHEN direction='IN' AND COALESCE(is_read,0)=0 THEN 1 ELSE 0 END) unread_count FROM chat_messages GROUP BY phone ORDER BY last_at DESC LIMIT 500").fetchall()
-        sent=c.execute("SELECT phone,MAX(candidate_name) candidate_name,MAX(created_at) last_at,COUNT(*) message_count FROM logs GROUP BY phone ORDER BY last_at DESC LIMIT 500").fetchall()
+        sent=c.execute("SELECT phone,MAX(candidate_name) candidate_name,MAX(created_at) last_at,COUNT(*) message_count FROM logs WHERE created_at>=? GROUP BY phone ORDER BY last_at DESC LIMIT 500",(_chat_cutoff(),)).fetchall()
     else:
         rows=c.execute("SELECT phone,MAX(candidate_name) candidate_name,MAX(created_at) last_at,COUNT(*) message_count,SUM(CASE WHEN direction='IN' AND COALESCE(is_read,0)=0 THEN 1 ELSE 0 END) unread_count FROM chat_messages WHERE user_id=? GROUP BY phone ORDER BY last_at DESC LIMIT 300",(u['id'],)).fetchall()
-        sent=c.execute("SELECT phone,MAX(candidate_name) candidate_name,MAX(created_at) last_at,COUNT(*) message_count FROM logs WHERE user_id=? GROUP BY phone ORDER BY last_at DESC LIMIT 300",(u['id'],)).fetchall()
+        sent=c.execute("SELECT phone,MAX(candidate_name) candidate_name,MAX(created_at) last_at,COUNT(*) message_count FROM logs WHERE user_id=? AND created_at>=? GROUP BY phone ORDER BY last_at DESC LIMIT 300",(u['id'],_chat_cutoff())).fetchall()
     merged={re.sub(r'\D','',str(r['phone'] or '')):dict(r) for r in rows}
     for r in sent:
         key=re.sub(r'\D','',str(r['phone'] or ''))
@@ -1599,10 +1650,10 @@ def chat_detail(phone:str,u=Depends(current_user)):
     c=db()
     if u['role']=='admin':
         incoming=c.execute('SELECT id,user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id,created_at FROM chat_messages WHERE phone=? ORDER BY id ASC LIMIT 1000',(digits,)).fetchall()
-        outgoing=c.execute("SELECT id,user_id,phone,candidate_name,'OUT' direction,kind message_type,template_name content,'' media_url,provider_message_id,created_at,status,detail FROM logs WHERE REPLACE(REPLACE(REPLACE(phone,'+',''),' ',''),'-','') LIKE ? ORDER BY id ASC LIMIT 1000",('%'+digits[-10:],)).fetchall()
+        outgoing=c.execute("SELECT id,user_id,phone,candidate_name,'OUT' direction,kind message_type,template_name content,'' media_url,provider_message_id,created_at,status,detail FROM logs WHERE REPLACE(REPLACE(REPLACE(phone,'+',''),' ',''),'-','') LIKE ? AND created_at>=? ORDER BY id ASC LIMIT 1000",('%'+digits[-10:],_chat_cutoff())).fetchall()
     else:
         incoming=c.execute('SELECT id,user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id,created_at FROM chat_messages WHERE phone=? AND user_id=? ORDER BY id ASC LIMIT 1000',(digits,u['id'])).fetchall()
-        outgoing=c.execute("SELECT id,user_id,phone,candidate_name,'OUT' direction,kind message_type,template_name content,'' media_url,provider_message_id,created_at,status,detail FROM logs WHERE user_id=? AND REPLACE(REPLACE(REPLACE(phone,'+',''),' ',''),'-','') LIKE ? ORDER BY id ASC LIMIT 1000",(u['id'],'%'+digits[-10:])).fetchall()
+        outgoing=c.execute("SELECT id,user_id,phone,candidate_name,'OUT' direction,kind message_type,template_name content,'' media_url,provider_message_id,created_at,status,detail FROM logs WHERE user_id=? AND REPLACE(REPLACE(REPLACE(phone,'+',''),' ',''),'-','') LIKE ? AND created_at>=? ORDER BY id ASC LIMIT 1000",(u['id'],'%'+digits[-10:],_chat_cutoff())).fetchall()
     items=[dict(x) for x in incoming]+[dict(x) for x in outgoing]
     items.sort(key=lambda x:str(x.get('created_at') or ''))
     c.close(); return items

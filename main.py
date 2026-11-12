@@ -262,7 +262,7 @@ def _status_sync_loop():
     while True:
         try: sync_pending_statuses(None,limit=20)
         except Exception: pass
-        time.sleep(60)
+        time.sleep(900)
 
 @app.post('/api/history/sync-status')
 def history_sync_status(u=Depends(current_user)):

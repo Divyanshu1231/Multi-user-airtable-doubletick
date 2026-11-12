@@ -133,14 +133,15 @@ async function deleteTemplate(id){if(confirm('Delete this template?')){await api
 async function chatsPage(){
  if(chatRefreshTimer){clearInterval(chatRefreshTimer);chatRefreshTimer=null}
  let a=await api('/chats');
- $('view').innerHTML=`<div class="heading"><div><h1>WhatsApp Chats</h1><div class="muted">Live candidate conversations. Replies refresh automatically.</div></div><div class="row"><button class="btn secondary ${me.role==='admin'?'':'hidden'}" onclick="backfillChats()">⬇ Import old replies</button><button class="btn secondary" onclick="refreshChats()">↻ Refresh</button></div></div><div class="card"><div class="grid" style="grid-template-columns:280px 1fr;align-items:start"><div><div class="field"><label>Search candidate / mobile</label><input id="chatSearch" placeholder="Search…" oninput="filterChatList()"></div><div class="row" id="chatFilters" style="gap:8px;margin:-4px 0 10px"><button class="btn secondary" id="cfAll" onclick="setChatFilter('all')">All</button><button class="btn secondary" id="cfUnread" onclick="setChatFilter('unread')">Unread <span id="unreadCount"></span></button></div><div id="chatlist" style="max-height:70vh;overflow:auto">${chatListHtml(a)}</div></div><div id="chatdetail" class="muted">Select a candidate to open conversation.</div></div></div>`;
+ $('view').innerHTML=`<div class="heading"><div><h1>WhatsApp Chats</h1><div class="muted">Live candidate conversations. Replies refresh automatically.</div></div><div class="row"><button class="btn secondary" onclick="backfillChats()">⬇ Import old replies</button><button class="btn secondary" onclick="refreshChats()">↻ Refresh</button></div></div><div class="card"><div class="grid" style="grid-template-columns:280px 1fr;align-items:start"><div><div class="field"><label>Search candidate / mobile</label><input id="chatSearch" placeholder="Search…" oninput="filterChatList()"></div><div class="row" id="chatFilters" style="gap:8px;margin:-4px 0 10px"><button class="btn secondary" id="cfAll" onclick="setChatFilter('all')">All</button><button class="btn secondary" id="cfUnread" onclick="setChatFilter('unread')">Unread <span id="unreadCount"></span></button></div><div id="chatlist" style="max-height:70vh;overflow:auto">${chatListHtml(a)}</div></div><div id="chatdetail" class="muted">Select a candidate to open conversation.</div></div></div>`;
  filterChatList();
  chatRefreshTimer=setInterval(()=>refreshChats().catch(e=>console.warn(e)),10000);
 }
 async function backfillChats(){
- const d=prompt('Pichhle kitne din ke replies import karne hain? (1-90)','30');if(!d)return;
+ const d=prompt('Pichhle kitne din ke replies import karne hain? (1-7)','7');if(!d)return;
  try{
   let r=await api('/chats/backfill?days='+encodeURIComponent(d),{method:'POST'});
+  if(r.already_running&&r.busy_other_user){alert('Abhi kisi aur ka import chal raha hai. 1-2 minute baad dobara try karo.');return}
   const btn=document.querySelector('button[onclick="backfillChats()"]');
   const poll=async()=>{let s=await api('/chats-backfill-status');if(btn)btn.textContent='Importing '+s.done+'/'+s.total+' · new '+s.inserted;
    if(s.running){setTimeout(poll,3000)}else{if(btn)btn.textContent='⬇ Import old replies';alert('Import complete. New replies: '+s.inserted+', already present: '+s.skipped_existing+', not found: '+s.not_found+', errors: '+s.errors+(s.last_error?'\nLast error: '+s.last_error:''));refreshChats().catch(()=>{})}};
@@ -180,6 +181,17 @@ function chatProviderReason(detail){
  if(raw.startsWith('{')||raw.startsWith('['))return '';
  return raw.length>500?raw.slice(0,500)+'…':raw;
 }
+function chatMediaHtml(x){
+ if(!x.media_url)return '';
+ const u=esc(x.media_url),ty=String(x.message_type||'').toUpperCase(),lower=String(x.media_url).toLowerCase().split('?')[0];
+ const isImg=ty==='IMAGE'||ty==='STICKER'||/\.(png|jpe?g|gif|webp)$/.test(lower);
+ const isAud=ty==='AUDIO'||ty==='VOICE'||/\.(mp3|ogg|opus|m4a|wav)$/.test(lower);
+ const isVid=ty==='VIDEO'||/\.(mp4|mov|webm)$/.test(lower);
+ if(isImg)return `<a target="_blank" rel="noopener" href="${u}"><img src="${u}" alt="image" style="max-width:260px;max-height:260px;border-radius:8px;margin-top:6px;display:block"></a>`;
+ if(isAud)return `<audio controls src="${u}" style="margin-top:6px;max-width:100%"></audio>`;
+ if(isVid)return `<video controls src="${u}" style="margin-top:6px;max-width:300px;border-radius:8px"></video>`;
+ return `<a class="btn secondary" target="_blank" rel="noopener" href="${u}" download style="display:inline-block;margin-top:6px;text-decoration:none">⬇ Open / Download ${esc(ty==='DOCUMENT'?'document':(ty||'file').toLowerCase())}</a>`;
+}
 function chatMessageHtml(x){
  const incoming=x.direction==='IN', st=String(x.status||'').toUpperCase();
  const labels={ENQUEUED:'Queued · awaiting delivery update',PROCESSING:'Processing',SENT:'Sent',DELIVERED:'Delivered',READ:'Read',FAILED:'Delivery failed',FREQUENCY_CAPPING:'⚠ Message not delivered due to frequency capping'};
@@ -195,7 +207,7 @@ function chatMessageHtml(x){
  const fallbackReason=st==='FREQUENCY_CAPPING'&&!reason?'Meta blocked this marketing message because of WhatsApp frequency capping (error 131049).':'';
  const statusHtml=st?`<div class="small" style="margin-top:7px;color:${colors[st]||'#475569'};font-weight:700">${esc(labels[st]||st)}</div>`:'';
  const reasonHtml=(showReason||fallbackReason)?`<div class="small" style="margin-top:4px;color:#7c2d12;white-space:pre-wrap">${esc(reason||fallbackReason)}</div>`:'';
- return `<div style="display:flex;justify-content:${incoming?'flex-start':'flex-end'};margin:9px 0"><div style="max-width:78%;padding:10px 13px;border-radius:12px;background:${incoming?'#fff':'#dbeafe'};border:1px solid #e5e7eb"><div class="small muted">${incoming?'Candidate':'You'} · ${esc(x.created_at||'')}</div><div style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(content)}</div>${x.media_url?`<a target="_blank" rel="noopener" href="${esc(x.media_url)}">Open ${esc(x.message_type||'media')}</a>`:''}${statusHtml}${reasonHtml}</div></div>`;
+ return `<div style="display:flex;justify-content:${incoming?'flex-start':'flex-end'};margin:9px 0"><div style="max-width:78%;padding:10px 13px;border-radius:12px;background:${incoming?'#fff':'#dbeafe'};border:1px solid #e5e7eb"><div class="small muted">${incoming?'Candidate':'You'} · ${esc(x.created_at||'')}</div><div style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(content)}</div>${chatMediaHtml(x)}${statusHtml}${reasonHtml}</div></div>`;
 }
 
 async function renderChat(phone,name){

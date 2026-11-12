@@ -284,6 +284,9 @@ def cleanup_old_chats():
         c=db()
         try:
             c.execute("DELETE FROM chat_messages WHERE created_at < ?",(_chat_cutoff(),))
+            # Remove WhatsApp delivery-error texts that older code saved as if the candidate had written them.
+            c.execute("DELETE FROM chat_messages WHERE direction='IN' AND COALESCE(provider_message_id,'')='' AND (content LIKE ? OR content LIKE ? OR content LIKE ? OR content LIKE ?)",
+                      ('This message was not delivered%','Message undeliverable%','Re-engagement message%','Message Undeliverable%'))
             c.commit()
         finally:
             c.close()
@@ -874,6 +877,77 @@ def _dt_audit(event, message_id, phone, raw_status, normalized, detail, payload,
         logging.getLogger("uvicorn.error").exception("DoubleTick webhook audit write failed")
 
 
+
+def _recent_same_incoming(c, phone, content, meta_source):
+    """True if the same text from the same phone was saved in the last 3 minutes by the
+    OTHER webhook format (Meta-raw ids start with 'wamid.', DoubleTick ids do not)."""
+    from datetime import datetime, timedelta, timezone
+    since=(datetime.now(timezone.utc)-timedelta(seconds=180)).strftime('%Y-%m-%d %H:%M:%S')
+    if meta_source:
+        sql="SELECT id FROM chat_messages WHERE phone=? AND direction='IN' AND content=? AND created_at>=? AND provider_message_id NOT LIKE ? LIMIT 1"
+    else:
+        sql="SELECT id FROM chat_messages WHERE phone=? AND direction='IN' AND content=? AND created_at>=? AND provider_message_id LIKE ? LIMIT 1"
+    return bool(c.execute(sql,(phone,content,since,'wamid.%')).fetchone())
+
+def _meta_message_text(m):
+    t=str(m.get('type') or 'text').lower()
+    obj=m.get(t) if isinstance(m.get(t),dict) else {}
+    if t=='text': return str(obj.get('body') or '')
+    if t=='reaction': return ''
+    if t=='button': return str(obj.get('text') or obj.get('payload') or '')
+    if t=='interactive':
+        r=obj.get('button_reply') or obj.get('list_reply') or {}
+        return str(r.get('title') or '')
+    caption=str(obj.get('caption') or '')
+    fn=str(obj.get('filename') or '')
+    if fn: return f'📄 {fn}'+('\n'+caption if caption else '')
+    return caption
+
+def _handle_meta_raw_payload(payload, logger):
+    """Raw Meta/WhatsApp Cloud envelope: {object:'whatsapp_business_account', entry:[{changes:[{value:{...}}]}]}.
+    Status entries are ignored (DoubleTick's own status webhook already covers them, and error
+    texts in them must never be saved as candidate replies). Real customer messages are saved."""
+    saved=skipped=statuses=0
+    c=db()
+    try:
+        for entry in payload.get('entry') or []:
+            for ch in (entry.get('changes') or []) if isinstance(entry,dict) else []:
+                val=ch.get('value') if isinstance(ch,dict) else None
+                if not isinstance(val,dict): continue
+                statuses+=len(val.get('statuses') or [])
+                names={}
+                for ct in val.get('contacts') or []:
+                    if isinstance(ct,dict):
+                        names[re.sub(r'\D','',str(ct.get('wa_id') or ''))]=str(((ct.get('profile') or {}).get('name')) or '')
+                for m in val.get('messages') or []:
+                    if not isinstance(m,dict): continue
+                    phone=re.sub(r'\D','',str(m.get('from') or ''))
+                    mtype=str(m.get('type') or 'text').upper()
+                    text=_meta_message_text(m)
+                    if mtype=='REACTION' or len(phone)<10: continue
+                    if not text: text=f'[{mtype}]'
+                    mid=str(m.get('id') or '').strip()
+                    if mid and c.execute("SELECT id FROM chat_messages WHERE provider_message_id=? LIMIT 1",(mid,)).fetchone():
+                        skipped+=1; continue
+                    if _recent_same_incoming(c,phone,text[:5000],True):
+                        skipped+=1; continue
+                    if DATABASE_URL:
+                        owner=c.execute("SELECT user_id,candidate_name FROM logs WHERE RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? ORDER BY id DESC LIMIT 1",(phone[-10:],)).fetchone()
+                    else:
+                        owner=c.execute("SELECT user_id,candidate_name FROM logs WHERE substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? ORDER BY id DESC LIMIT 1",(phone[-10:],)).fetchone()
+                    name=str((owner['candidate_name'] if owner and owner['candidate_name'] else '') or names.get(phone) or phone)[:200]
+                    c.execute("INSERT INTO chat_messages(user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id) VALUES(?,?,?,?,?,?,?,?)",
+                              (owner['user_id'] if owner else None,phone,name,'IN',mtype,text[:5000],'',mid))
+                    saved+=1
+        c.commit()
+    except Exception:
+        c.rollback(); logger.exception("Meta raw webhook processing failed"); raise HTTPException(500,'Could not process webhook')
+    finally:
+        c.close()
+    _dt_audit('META_RAW','','','','',f'messages_saved={saved} duplicates={skipped} statuses_ignored={statuses}',payload,
+              'meta_raw_messages_saved' if saved else ('meta_raw_status_ignored' if statuses else 'meta_raw_nothing'))
+    return {'ok':True,'format':'meta_raw','saved':saved,'duplicates':skipped,'statuses_ignored':statuses}
+
 @app.get('/api/webhooks/doubletick')
 async def doubletick_webhook_verify(request: Request,
                                     x_webhook_secret: Optional[str] = Header(None)):
@@ -964,6 +1038,9 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
         logger.info("DoubleTick webhook acknowledged non-object payload")
         _dt_audit('NON_OBJECT','','','','','',raw_body.decode('utf-8','replace'),'ignored_non_object')
         return {'ok': True, 'ignored': True, 'reason': 'Payload is not an object'}
+
+    if payload.get('object') == 'whatsapp_business_account' and isinstance(payload.get('entry'), list):
+        return _handle_meta_raw_payload(payload, logger)
 
     # Unwrap nested provider envelopes. DoubleTick integrations can deliver
     # the event directly or inside data/payload/body/eventData.
@@ -1116,6 +1193,8 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
                     "SELECT id FROM chat_messages WHERE provider_message_id=? "
                     "AND provider_message_id<>'' LIMIT 1", (message_id,)
                 ).fetchone()
+            if not duplicate and _recent_same_incoming(c, phone_digits, str(text_value)[:5000], False):
+                duplicate = {'id': 0}
             if not duplicate:
                 c.execute(
                     "INSERT INTO chat_messages(user_id,phone,candidate_name,direction,"

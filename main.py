@@ -294,24 +294,119 @@ def cleanup_old_chats():
         import logging
         logging.getLogger("uvicorn.error").exception("Old chat cleanup failed")
 
-# ---- Import old customer replies from DoubleTick (backfill) ----
+# ---- Import customer replies from DoubleTick (manual backfill + automatic sync) ----
 _backfill_states={}
 _backfill_lock=threading.Lock()
+_auto_lock=threading.Lock()
+_auto_state={'last_start':0.0,'offset':0,'last_summary':{}}
 
 def _new_backfill_state():
     return {'sample':'','links_added':0,'running':False,'total':0,'done':0,'inserted':0,'skipped_existing':0,'not_found':0,'errors':0,'last_error':'','finished':False}
 
-def _run_chat_backfill(days, max_phones, user_id, st):
-    """user_id=None imports for every recruiter (admin); otherwise only chats whose
-    latest owner is that recruiter."""
-    from datetime import datetime, timedelta, timezone
+def _kv_get(c,k):
+    c.execute("CREATE TABLE IF NOT EXISTS app_kv(k TEXT PRIMARY KEY, v TEXT)")
+    r=c.execute("SELECT v FROM app_kv WHERE k=?",(k,)).fetchone()
+    return r['v'] if r else None
+
+def _kv_set(c,k,v):
+    c.execute("CREATE TABLE IF NOT EXISTS app_kv(k TEXT PRIMARY KEY, v TEXT)")
+    c.execute("INSERT INTO app_kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",(k,str(v)))
+    c.commit()
+
+def _norm_phone(raw):
+    d=re.sub(r'\D','',str(raw or ''))
+    if len(d)==10: d='91'+d
+    return d if len(d)>=11 else ''
+
+def _import_phone(c, key, waba, d, start, oldest, now, st, only_user=None):
+    """Fetch one candidate's chat from DoubleTick and save customer messages not yet in the DB.
+    Also attaches missing download links to rows saved earlier by the webhook."""
+    from datetime import datetime, timezone
+    owner_sql=("SELECT user_id,candidate_name FROM logs WHERE RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? ORDER BY id DESC LIMIT 1" if DATABASE_URL else
+               "SELECT user_id,candidate_name FROM logs WHERE substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? ORDER BY id DESC LIMIT 1")
+    owner=c.execute(owner_sql,(d[-10:],)).fetchone()
+    owner_uid=owner['user_id'] if owner else None
+    if only_user and owner_uid!=only_user: return
+    hdr={'Authorization':key,'Accept':'application/json'}
+    prm={'wabaNumber':waba,'customerNumber':d,'startDate':start}
+    resp=requests.get('https://public.doubletick.io/chat-messages',headers=hdr,params=prm,timeout=30)
+    if resp.status_code==429:
+        time.sleep(10)
+        resp=requests.get('https://public.doubletick.io/chat-messages',headers=hdr,params=prm,timeout=30)
+    if resp.status_code==404: st['not_found']=st.get('not_found',0)+1; return
+    if resp.status_code not in (200,201):
+        st['errors']=st.get('errors',0)+1; st['last_error']=f'HTTP {resp.status_code}: {resp.text[:200]}'; return
+    data=resp.json()
+    items=data.get('messages') if isinstance(data,dict) else data
+    for it in (items or []):
+        if not isinstance(it,dict): continue
+        if str(it.get('messageOriginType') or '').upper()!='CUSTOMER': continue
+        mid=str(it.get('id') or '').strip()
+        m=it.get('message') if isinstance(it.get('message'),dict) else {}
+        doc=m.get('document') if isinstance(m.get('document'),dict) else {}
+        mtype=str(m.get('messageType') or m.get('type') or 'TEXT').upper()
+        if mtype!='TEXT' and not st.get('sample'):
+            st['sample']=json.dumps(it,ensure_ascii=False,default=str)[:900]
+        media=str(m.get('url') or m.get('mediaUrl') or doc.get('url') or doc.get('link') or '')[:2000]
+        if not media and mtype!='TEXT':
+            for k,v in m.items():
+                if k not in ('text','caption') and isinstance(v,str) and v.startswith(('http://','https://')): media=v[:2000]; break
+                if isinstance(v,dict):
+                    for k2,v2 in v.items():
+                        if isinstance(v2,str) and v2.startswith(('http://','https://')): media=v2[:2000]; break
+                    if media: break
+        fname=str(m.get('fileName') or m.get('filename') or doc.get('filename') or doc.get('fileName') or '').strip()
+        text=m.get('text') or m.get('caption') or ''
+        if isinstance(text,dict): text=text.get('body') or json.dumps(text,ensure_ascii=False)
+        text=str(text or '')
+        if fname: text=(f'📄 {fname}'+('\n'+text if text else ''))
+        if not text: text=f'[{mtype}]' if media else f'[{mtype} message]'
+        text=text[:5000]
+        try: when=datetime.fromtimestamp(int(it.get('messageTime'))/1000,tz=timezone.utc)
+        except Exception: when=now
+        if when<oldest: continue   # would be removed by the retention cleanup anyway
+        same=c.execute("SELECT id,media_url FROM chat_messages WHERE provider_message_id=? LIMIT 1",(mid,)).fetchone() if mid else None
+        if same:
+            if media and not (same['media_url'] or ''):
+                c.execute("UPDATE chat_messages SET media_url=?,message_type=? WHERE id=?",(media,mtype,same['id'])); st['links_added']=st.get('links_added',0)+1
+            st['skipped_existing']=st.get('skipped_existing',0)+1; continue
+        dup=None
+        for ex in c.execute("SELECT id,media_url,message_type,content,created_at FROM chat_messages WHERE phone=? AND direction='IN'",(d,)).fetchall():
+            try:
+                same_text=(ex['content']==text)
+                file_like=bool(media) and mtype!='TEXT' and not (ex['media_url'] or '') and str(ex['message_type'] or '').upper()!='TEXT'
+                if not (same_text or file_like): continue
+                exd=ex['created_at'] if not isinstance(ex['created_at'],str) else datetime.fromisoformat(ex['created_at'].replace('T',' ').split('.')[0])
+                if abs((exd.replace(tzinfo=None)-when.replace(tzinfo=None)).total_seconds())<(180 if same_text else 600): dup=ex; break
+            except Exception: pass
+        if dup:
+            if media and not (dup['media_url'] or ''):
+                c.execute("UPDATE chat_messages SET media_url=?,message_type=? WHERE id=?",(media,mtype,dup['id'])); st['links_added']=st.get('links_added',0)+1
+            st['skipped_existing']=st.get('skipped_existing',0)+1; continue
+        is_read=0 if (now-when).total_seconds()<48*3600 else 1
+        name=str((owner['candidate_name'] if owner else '') or d)[:200]
+        c.execute("INSERT INTO chat_messages(user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id,created_at,is_read) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                  (owner_uid,d,name,'IN',mtype,text,media,mid,when.strftime('%Y-%m-%d %H:%M:%S'),is_read))
+        st['inserted']=st.get('inserted',0)+1
+    c.commit()
+
+def _dt_ready(st=None):
     key=os.getenv('DOUBLETICK_API_KEY','').strip()
-    try:
-        waba=dt_sender_number()
+    try: waba=dt_sender_number()
     except Exception as exc:
-        st.update(running=False,finished=True,last_error=str(getattr(exc,'detail',exc))); _backfill_lock.release(); return
+        if st is not None: st['last_error']=str(getattr(exc,'detail',exc))
+        return None,None
     if not key:
-        st.update(running=False,finished=True,last_error='DOUBLETICK_API_KEY missing'); _backfill_lock.release(); return
+        if st is not None: st['last_error']='DOUBLETICK_API_KEY missing'
+        return None,None
+    return key,waba
+
+def _run_chat_backfill(days, max_phones, user_id, st):
+    """Manual import button. user_id=None imports for every recruiter (admin); otherwise only that recruiter's chats."""
+    from datetime import datetime, timedelta, timezone
+    key,waba=_dt_ready(st)
+    if not key:
+        st.update(running=False,finished=True); _backfill_lock.release(); return
     now=datetime.now(timezone.utc)
     start=(now+timedelta(hours=5,minutes=30)-timedelta(days=days)).strftime('%d-%m-%Y')
     oldest=now-timedelta(days=CHAT_RETENTION_DAYS)
@@ -323,87 +418,16 @@ def _run_chat_backfill(days, max_phones, user_id, st):
             rows=c.execute("SELECT phone,MAX(id) mid FROM logs WHERE COALESCE(phone,'')<>'' GROUP BY phone ORDER BY mid DESC LIMIT ?",(max_phones,)).fetchall()
         phones=[]; seen=set()
         for r in rows:
-            d=re.sub(r'\D','',str(r['phone'] or ''))
-            if len(d)==10: d='91'+d
-            if len(d)>=11 and d not in seen: seen.add(d); phones.append(d)
+            d=_norm_phone(r['phone'])
+            if d and d not in seen: seen.add(d); phones.append(d)
         st['total']=len(phones)
-        owner_sql=("SELECT user_id,candidate_name FROM logs WHERE RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? ORDER BY id DESC LIMIT 1" if DATABASE_URL else
-                   "SELECT user_id,candidate_name FROM logs WHERE substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? ORDER BY id DESC LIMIT 1")
         for d in phones:
             try:
-                owner=c.execute(owner_sql,(d[-10:],)).fetchone()
-                owner_uid=owner['user_id'] if owner else None
-                if user_id and owner_uid!=user_id:
-                    st['done']+=1; continue   # another recruiter owns this chat now
-                resp=requests.get('https://public.doubletick.io/chat-messages',
-                                  headers={'Authorization':key,'Accept':'application/json'},
-                                  params={'wabaNumber':waba,'customerNumber':d,'startDate':start},timeout=30)
-                if resp.status_code==429:
-                    time.sleep(10)
-                    resp=requests.get('https://public.doubletick.io/chat-messages',
-                                      headers={'Authorization':key,'Accept':'application/json'},
-                                      params={'wabaNumber':waba,'customerNumber':d,'startDate':start},timeout=30)
-                if resp.status_code==404: st['not_found']+=1
-                elif resp.status_code not in (200,201):
-                    st['errors']+=1; st['last_error']=f'HTTP {resp.status_code}: {resp.text[:200]}'
-                else:
-                    data=resp.json()
-                    items=data.get('messages') if isinstance(data,dict) else data
-                    for it in (items or []):
-                        if not isinstance(it,dict): continue
-                        if str(it.get('messageOriginType') or '').upper()!='CUSTOMER': continue
-                        mid=str(it.get('id') or '').strip()
-                        m=it.get('message') if isinstance(it.get('message'),dict) else {}
-                        doc=m.get('document') if isinstance(m.get('document'),dict) else {}
-                        mtype=str(m.get('messageType') or m.get('type') or 'TEXT').upper()
-                        if mtype!='TEXT' and not st.get('sample'):
-                            st['sample']=json.dumps(it,ensure_ascii=False,default=str)[:900]
-                        media=str(m.get('url') or m.get('mediaUrl') or doc.get('url') or doc.get('link') or '')[:2000]
-                        if not media and mtype!='TEXT':
-                            for k,v in m.items():
-                                if k not in ('text','caption') and isinstance(v,str) and v.startswith(('http://','https://')): media=v[:2000]; break
-                                if isinstance(v,dict):
-                                    for k2,v2 in v.items():
-                                        if isinstance(v2,str) and v2.startswith(('http://','https://')): media=v2[:2000]; break
-                                    if media: break
-                        fname=str(m.get('fileName') or m.get('filename') or doc.get('filename') or doc.get('fileName') or '').strip()
-                        text=m.get('text') or m.get('caption') or ''
-                        if isinstance(text,dict): text=text.get('body') or json.dumps(text,ensure_ascii=False)
-                        text=str(text or '')
-                        if fname: text=(f'📄 {fname}'+('\n'+text if text else ''))
-                        if not text: text=f'[{mtype}]' if media else f'[{mtype} message]'
-                        text=text[:5000]
-                        try: when=datetime.fromtimestamp(int(it.get('messageTime'))/1000,tz=timezone.utc)
-                        except Exception: when=now
-                        if when<oldest: continue   # would be removed by the 7-day cleanup anyway
-                        same=c.execute("SELECT id,media_url FROM chat_messages WHERE provider_message_id=? LIMIT 1",(mid,)).fetchone() if mid else None
-                        if same:
-                            if media and not (same['media_url'] or ''):
-                                c.execute("UPDATE chat_messages SET media_url=?,message_type=? WHERE id=?",(media,mtype,same['id'])); st['links_added']=st.get('links_added',0)+1
-                            st['skipped_existing']+=1; continue
-                        dup=None
-                        for ex in c.execute("SELECT id,media_url,message_type,content,created_at FROM chat_messages WHERE phone=? AND direction='IN'",(d,)).fetchall():
-                            try:
-                                same_text=(ex['content']==text)
-                                file_like=bool(media) and mtype!='TEXT' and not (ex['media_url'] or '') and str(ex['message_type'] or '').upper()!='TEXT'
-                                if not (same_text or file_like): continue
-                                exd=ex['created_at'] if not isinstance(ex['created_at'],str) else datetime.fromisoformat(ex['created_at'].replace('T',' ').split('.')[0])
-                                if abs((exd.replace(tzinfo=None)-when.replace(tzinfo=None)).total_seconds())<(180 if same_text else 600): dup=ex; break
-                            except Exception: pass
-                        if dup:
-                            if media and not (dup['media_url'] or ''):
-                                c.execute("UPDATE chat_messages SET media_url=?,message_type=? WHERE id=?",(media,mtype,dup['id'])); st['links_added']=st.get('links_added',0)+1
-                            st['skipped_existing']+=1; continue
-                        is_read=0 if (now-when).total_seconds()<48*3600 else 1
-                        name=str((owner['candidate_name'] if owner else '') or d)[:200]
-                        c.execute("INSERT INTO chat_messages(user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id,created_at,is_read) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                                  (owner_uid,d,name,'IN',mtype,text,media,mid,when.strftime('%Y-%m-%d %H:%M:%S'),is_read))
-                        st['inserted']+=1
-                    c.commit()
+                _import_phone(c,key,waba,d,start,oldest,now,st,user_id)
             except Exception as exc:
                 try: c.rollback()
                 except Exception: pass
-                st['errors']+=1; st['last_error']=str(exc)[:200]
+                st['errors']=st.get('errors',0)+1; st['last_error']=str(exc)[:200]
             st['done']+=1
             time.sleep(0.3)
     finally:
@@ -426,9 +450,94 @@ def chats_backfill_status(u=Depends(current_user)):
     key=0 if u['role']=='admin' else u['id']
     return dict(_backfill_states.setdefault(key,_new_backfill_state()))
 
+# ---- Automatic sync: keeps chats up to date without pressing Import ----
+def run_auto_sync(limit=250, days=2, full=False):
+    """Pull recent replies for (1) chats that already have customer messages in the last 3 days and
+    (2) numbers we messaged in the last 3 days (rotating window). full=True imports the whole retention window."""
+    from datetime import datetime, timedelta, timezone
+    if not _auto_lock.acquire(blocking=False): return {'skipped':'already running'}
+    st={'inserted':0,'skipped_existing':0,'not_found':0,'errors':0,'links_added':0}
+    try:
+        if _backfill_lock.locked(): return {'skipped':'manual import running'}
+        key,waba=_dt_ready(st)
+        if not key: return {'skipped':st.get('last_error','not configured')}
+        now=datetime.now(timezone.utc)
+        oldest=now-timedelta(days=CHAT_RETENTION_DAYS)
+        start=(now+timedelta(hours=5,minutes=30)-timedelta(days=(CHAT_RETENTION_DAYS if full else days))).strftime('%d-%m-%Y')
+        since=(now-timedelta(days=(CHAT_RETENTION_DAYS if full else 3))).strftime('%Y-%m-%d %H:%M:%S')
+        c=db()
+        try:
+            phones=[]; seen=set()
+            if not full:
+                for r in c.execute("SELECT DISTINCT phone FROM chat_messages WHERE direction='IN' AND created_at>=? LIMIT 500",(since,)).fetchall():
+                    d=_norm_phone(r['phone'])
+                    if d and d not in seen: seen.add(d); phones.append(d)
+            recent=[]
+            for r in c.execute("SELECT phone,MAX(id) mid FROM logs WHERE COALESCE(phone,'')<>'' AND created_at>=? GROUP BY phone ORDER BY mid DESC LIMIT 6000",(since,)).fetchall():
+                d=_norm_phone(r['phone'])
+                if d and d not in seen: seen.add(d); recent.append(d)
+            if full:
+                batch=phones+recent
+            else:
+                room=max(0,limit-len(phones))
+                off=_auto_state['offset']%max(1,len(recent)) if recent else 0
+                rot=(recent[off:]+recent[:off])[:room]
+                _auto_state['offset']=(off+len(rot))%max(1,len(recent)) if recent else 0
+                batch=phones[:limit]+rot
+            for d in batch:
+                try:
+                    _import_phone(c,key,waba,d,start,oldest,now,st)
+                except Exception as exc:
+                    try: c.rollback()
+                    except Exception: pass
+                    st['errors']+=1; st['last_error']=str(exc)[:200]
+                time.sleep(0.25)
+            st['checked']=len(batch)
+        finally:
+            c.close()
+    except Exception:
+        import logging
+        logging.getLogger("uvicorn.error").exception("Automatic chat sync failed")
+    finally:
+        _auto_lock.release()
+    st.pop('sample',None); _auto_state['last_summary']=st
+    return st
+
+@app.post('/api/chats/auto-sync')
+def chats_auto_sync(u=Depends(current_user)):
+    """Called by the Chats page while it is open (at most about once a minute)."""
+    if time.time()-_auto_state['last_start']<45: return {'ok':True,'throttled':True}
+    _auto_state['last_start']=time.time()
+    threading.Thread(target=run_auto_sync,kwargs={'limit':120},daemon=True).start()
+    return {'ok':True,'started':True,'last':_auto_state.get('last_summary',{})}
+
+def _auto_import_loop():
+    """Once: import the whole retention window. Then: every 15 minutes (07:00-23:00 IST) fetch recent replies."""
+    from datetime import datetime, timedelta, timezone
+    time.sleep(90)
+    try:
+        c=db()
+        try: done=_kv_get(c,'auto_initial_import_done')
+        finally: c.close()
+        if not done:
+            run_auto_sync(full=True)
+            c=db()
+            try: _kv_set(c,'auto_initial_import_done',datetime.now(timezone.utc).isoformat())
+            finally: c.close()
+    except Exception:
+        import logging
+        logging.getLogger("uvicorn.error").exception("Initial chat import failed")
+    while True:
+        time.sleep(900)
+        try:
+            hour=(datetime.now(timezone.utc)+timedelta(hours=5,minutes=30)).hour
+            if 7<=hour<23: run_auto_sync(limit=300)
+        except Exception: pass
+
 @app.on_event('startup')
 def startup():
     threading.Thread(target=_status_sync_loop,daemon=True).start()
+    threading.Thread(target=_auto_import_loop,daemon=True).start()
     cleanup_old_chats()
     # ADMIN_USERNAME / ADMIN_PASSWORD are the authoritative bootstrap credentials.
     # Existing HR users, templates, settings, logs and chats are never deleted.

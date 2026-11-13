@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Optional
 import csv, io
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, UploadFile, File
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -1762,6 +1762,34 @@ def chats(u=Depends(current_user)):
         key=re.sub(r'\D','',str(r['phone'] or ''))
         if key: merged[key]=({**dict(r), 'unread_count':0} if key not in merged else {**merged[key], 'last_at':max(str(merged[key].get('last_at') or ''),str(r['last_at'] or ''))})
     c.close(); return sorted(merged.values(),key=lambda x:str(x.get('last_at') or ''),reverse=True)
+
+
+@app.get('/api/chat-media/{msg_id}')
+def chat_media(msg_id:int,u=Depends(current_user)):
+    """DoubleTick media links need the API key in an Authorization header, so the browser
+    cannot open them directly. The server fetches the file and streams it to the logged-in user."""
+    from urllib.parse import urlparse
+    c=db()
+    try:
+        row=c.execute("SELECT user_id,media_url FROM chat_messages WHERE id=?",(msg_id,)).fetchone()
+    finally:
+        c.close()
+    if not row or not (row['media_url'] or '').strip(): raise HTTPException(404,'No file attached to this message')
+    if u['role']!='admin' and row['user_id']!=u['id']: raise HTTPException(403,'Not allowed')
+    url=row['media_url'].strip(); host=(urlparse(url).hostname or '').lower()
+    if not url.startswith('https://') or not (host=='doubletick.io' or host.endswith('.doubletick.io')):
+        raise HTTPException(400,'File link is not a DoubleTick media URL')
+    key=os.getenv('DOUBLETICK_API_KEY','').strip()
+    if not key: raise HTTPException(503,'DOUBLETICK_API_KEY is not configured on the backend.')
+    try:
+        r=requests.get(url,headers={'Authorization':key},timeout=60)
+    except Exception as exc:
+        raise HTTPException(502,'Could not reach DoubleTick media server: '+str(exc)[:150])
+    if r.status_code!=200:
+        raise HTTPException(502 if r.status_code>=500 else r.status_code,f'DoubleTick media server returned {r.status_code}: {r.text[:150]}')
+    if len(r.content)>30*1024*1024: raise HTTPException(413,'File is larger than 30 MB')
+    return Response(content=r.content,media_type=r.headers.get('content-type') or 'application/octet-stream',
+                    headers={'Cache-Control':'private, max-age=3600'})
 
 @app.get('/api/chats/{phone}')
 def chat_detail(phone:str,u=Depends(current_user)):

@@ -150,7 +150,7 @@ async function backfillChats(){
  }catch(e){alert(e.message)}
 }
 let lastAutoSync=0;
-function autoSyncChats(){const n=Date.now();if(n-lastAutoSync<60000)return;lastAutoSync=n;api('/chats/auto-sync',{method:'POST'}).catch(()=>{})}
+function autoSyncChats(){const n=Date.now();if(n-lastAutoSync<30000)return;lastAutoSync=n;api('/chats/auto-sync',{method:'POST'}).catch(()=>{})}
 async function refreshChats(){
  autoSyncChats();
  api('/history/sync-status',{method:'POST'}).catch(()=>{});

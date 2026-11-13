@@ -144,7 +144,7 @@ async function backfillChats(){
   if(r.already_running&&r.busy_other_user){alert('Abhi kisi aur ka import chal raha hai. 1-2 minute baad dobara try karo.');return}
   const btn=document.querySelector('button[onclick="backfillChats()"]');
   const poll=async()=>{let s=await api('/chats-backfill-status');if(btn)btn.textContent='Importing '+s.done+'/'+s.total+' · new '+s.inserted;
-   if(s.running){setTimeout(poll,3000)}else{if(btn)btn.textContent='⬇ Import old replies';alert('Import complete. New replies: '+s.inserted+', already present: '+s.skipped_existing+', not found: '+s.not_found+', errors: '+s.errors+(s.last_error?'\nLast error: '+s.last_error:''));refreshChats().catch(()=>{})}};
+   if(s.running){setTimeout(poll,3000)}else{if(btn)btn.textContent='⬇ Import old replies';alert('Import complete. New replies: '+s.inserted+', already present: '+s.skipped_existing+', links added to old files: '+(s.links_added||0)+', not found: '+s.not_found+', errors: '+s.errors+(s.last_error?'\nLast error: '+s.last_error:''));refreshChats().catch(()=>{})}};
   poll();
  }catch(e){alert(e.message)}
 }

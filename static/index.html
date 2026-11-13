@@ -181,16 +181,42 @@ function chatProviderReason(detail){
  if(raw.startsWith('{')||raw.startsWith('['))return '';
  return raw.length>500?raw.slice(0,500)+'…':raw;
 }
+const chatMediaCache={};
+async function fetchChatMedia(id){
+ const r=await fetch('/api/chat-media/'+id,{headers:{'Authorization':'Bearer '+token}});
+ if(!r.ok){let d=await r.json().catch(()=>({}));throw Error(d.detail||('HTTP '+r.status))}
+ return r.blob();
+}
+async function chatMediaUrl(id){
+ if(chatMediaCache[id])return chatMediaCache[id];
+ const b=await fetchChatMedia(id);return chatMediaCache[id]=URL.createObjectURL(b);
+}
+async function downloadChatMedia(btn){
+ const id=btn.dataset.mediaId,name=btn.dataset.name||'file',old=btn.textContent;
+ btn.disabled=true;btn.textContent='Downloading…';
+ try{const u=await chatMediaUrl(id);const a=document.createElement('a');a.href=u;a.download=name;document.body.appendChild(a);a.click();a.remove()}
+ catch(e){alert('File could not be downloaded: '+e.message)}
+ finally{btn.disabled=false;btn.textContent=old}
+}
+function hydrateChatMedia(){
+ document.querySelectorAll('[data-media-load]').forEach(async el=>{
+  if(el.dataset.busy)return;el.dataset.busy='1';
+  try{const u=await chatMediaUrl(el.dataset.mediaLoad);el.src=u;if(el.tagName==='IMG'){el.style.cursor='zoom-in';el.onclick=()=>window.open(u,'_blank')}}
+  catch(e){const s=document.createElement('div');s.className='small muted';s.textContent='File could not be loaded: '+e.message;el.replaceWith(s)}
+ });
+}
 function chatMediaHtml(x){
- if(!x.media_url)return '';
- const u=esc(x.media_url),ty=String(x.message_type||'').toUpperCase(),lower=String(x.media_url).toLowerCase().split('?')[0];
+ if(!x.media_url||x.direction!=='IN')return '';
+ const id=x.id,ty=String(x.message_type||'').toUpperCase(),lower=String(x.media_url).toLowerCase().split('?')[0];
  const isImg=ty==='IMAGE'||ty==='STICKER'||/\.(png|jpe?g|gif|webp)$/.test(lower);
  const isAud=ty==='AUDIO'||ty==='VOICE'||/\.(mp3|ogg|opus|m4a|wav)$/.test(lower);
  const isVid=ty==='VIDEO'||/\.(mp4|mov|webm)$/.test(lower);
- if(isImg)return `<a target="_blank" rel="noopener" href="${u}"><img src="${u}" alt="image" style="max-width:260px;max-height:260px;border-radius:8px;margin-top:6px;display:block"></a>`;
- if(isAud)return `<audio controls src="${u}" style="margin-top:6px;max-width:100%"></audio>`;
- if(isVid)return `<video controls src="${u}" style="margin-top:6px;max-width:300px;border-radius:8px"></video>`;
- return `<a class="btn secondary" target="_blank" rel="noopener" href="${u}" download style="display:inline-block;margin-top:6px;text-decoration:none">⬇ Open / Download ${esc(ty==='DOCUMENT'?'document':(ty||'file').toLowerCase())}</a>`;
+ const cached=chatMediaCache[id]?` src="${chatMediaCache[id]}"`:'';
+ const name=String(x.content||'').replace(/^📄\s*/,'').split('\n')[0].trim()||'file';
+ if(isImg)return `<img data-media-load="${id}"${cached} alt="image" style="max-width:260px;max-height:260px;border-radius:8px;margin-top:6px;display:block;background:#f1f5f9;min-width:60px;min-height:40px">`;
+ if(isAud)return `<audio controls data-media-load="${id}"${cached} style="margin-top:6px;max-width:100%"></audio>`;
+ if(isVid)return `<video controls data-media-load="${id}"${cached} style="margin-top:6px;max-width:300px;border-radius:8px"></video>`;
+ return `<button class="btn secondary" data-media-id="${id}" data-name="${esc(name)}" onclick="downloadChatMedia(this)" style="margin-top:6px">⬇ Download ${esc(ty==='DOCUMENT'?'document':(ty||'file').toLowerCase())}</button>`;
 }
 function chatMessageHtml(x){
  const incoming=x.direction==='IN', st=String(x.status||'').toUpperCase();
@@ -226,7 +252,7 @@ async function renderChat(phone,name){
    newField.value=draft;
    if(wasFocused){newField.focus();try{newField.setSelectionRange(selectionStart,selectionEnd)}catch(_){}}
  }
- let m=$('chatmessages');m.scrollTop=m.scrollHeight;
+ let m=$('chatmessages');m.scrollTop=m.scrollHeight;hydrateChatMedia();
 }
 async function loadInternalNotes(phone){
  const host=$('internalNotesList');if(!host)return;

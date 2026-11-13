@@ -367,15 +367,21 @@ def _run_chat_backfill(days, max_phones, user_id, st):
                         try: when=datetime.fromtimestamp(int(it.get('messageTime'))/1000,tz=timezone.utc)
                         except Exception: when=now
                         if when<oldest: continue   # would be removed by the 7-day cleanup anyway
-                        if mid and c.execute("SELECT id FROM chat_messages WHERE provider_message_id=? LIMIT 1",(mid,)).fetchone():
+                        same=c.execute("SELECT id,media_url FROM chat_messages WHERE provider_message_id=? LIMIT 1",(mid,)).fetchone() if mid else None
+                        if same:
+                            if media and not (same['media_url'] or ''):
+                                c.execute("UPDATE chat_messages SET media_url=?,message_type=? WHERE id=?",(media,mtype,same['id'])); st['links_added']=st.get('links_added',0)+1
                             st['skipped_existing']+=1; continue
-                        dup=False
-                        for ex in c.execute("SELECT created_at FROM chat_messages WHERE phone=? AND direction='IN' AND content=?",(d,text)).fetchall():
+                        dup=None
+                        for ex in c.execute("SELECT id,media_url,created_at FROM chat_messages WHERE phone=? AND direction='IN' AND content=?",(d,text)).fetchall():
                             try:
                                 exd=ex['created_at'] if not isinstance(ex['created_at'],str) else datetime.fromisoformat(ex['created_at'].replace('T',' ').split('.')[0])
-                                if abs((exd.replace(tzinfo=None)-when.replace(tzinfo=None)).total_seconds())<180: dup=True; break
+                                if abs((exd.replace(tzinfo=None)-when.replace(tzinfo=None)).total_seconds())<180: dup=ex; break
                             except Exception: pass
-                        if dup: st['skipped_existing']+=1; continue
+                        if dup:
+                            if media and not (dup['media_url'] or ''):
+                                c.execute("UPDATE chat_messages SET media_url=?,message_type=? WHERE id=?",(media,mtype,dup['id'])); st['links_added']=st.get('links_added',0)+1
+                            st['skipped_existing']+=1; continue
                         is_read=0 if (now-when).total_seconds()<48*3600 else 1
                         name=str((owner['candidate_name'] if owner else '') or d)[:200]
                         c.execute("INSERT INTO chat_messages(user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id,created_at,is_read) VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -884,10 +890,10 @@ def _recent_same_incoming(c, phone, content, meta_source):
     from datetime import datetime, timedelta, timezone
     since=(datetime.now(timezone.utc)-timedelta(seconds=180)).strftime('%Y-%m-%d %H:%M:%S')
     if meta_source:
-        sql="SELECT id FROM chat_messages WHERE phone=? AND direction='IN' AND content=? AND created_at>=? AND provider_message_id NOT LIKE ? LIMIT 1"
+        sql="SELECT id,media_url FROM chat_messages WHERE phone=? AND direction='IN' AND content=? AND created_at>=? AND provider_message_id NOT LIKE ? LIMIT 1"
     else:
-        sql="SELECT id FROM chat_messages WHERE phone=? AND direction='IN' AND content=? AND created_at>=? AND provider_message_id LIKE ? LIMIT 1"
-    return bool(c.execute(sql,(phone,content,since,'wamid.%')).fetchone())
+        sql="SELECT id,media_url FROM chat_messages WHERE phone=? AND direction='IN' AND content=? AND created_at>=? AND provider_message_id LIKE ? LIMIT 1"
+    return c.execute(sql,(phone,content,since,'wamid.%')).fetchone()
 
 def _meta_message_text(m):
     t=str(m.get('type') or 'text').lower()
@@ -1133,6 +1139,22 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
     doc_obj = msg.get('document') if isinstance(msg.get('document'), dict) else {}
     if not media_url:
         media_url = str(doc_obj.get('url') or doc_obj.get('link') or '')
+    if not media_url and str(msg.get('type') or msg.get('messageType') or 'TEXT').upper() not in ('TEXT', 'BUTTON', 'INTERACTIVE', 'TEMPLATE'):
+        def _scan_url(o, depth=0):
+            if depth > 4: return ''
+            if isinstance(o, dict):
+                for k, v in o.items():
+                    if k in ('text', 'body', 'caption', 'contact', 'customer', 'sender', 'senderUser', 'context'): continue
+                    r = _scan_url(v, depth + 1)
+                    if r: return r
+            elif isinstance(o, list):
+                for v in o:
+                    r = _scan_url(v, depth + 1)
+                    if r: return r
+            elif isinstance(o, str) and o.startswith(('http://', 'https://')):
+                return o
+            return ''
+        media_url = _scan_url(msg)
     file_name = str(msg.get('fileName') or msg.get('filename') or msg.get('file_name') or
                     doc_obj.get('filename') or doc_obj.get('fileName') or '').strip()
     message_type = str(msg.get('type') or msg.get('messageType') or
@@ -1193,8 +1215,15 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
                     "SELECT id FROM chat_messages WHERE provider_message_id=? "
                     "AND provider_message_id<>'' LIMIT 1", (message_id,)
                 ).fetchone()
-            if not duplicate and _recent_same_incoming(c, phone_digits, str(text_value)[:5000], False):
-                duplicate = {'id': 0}
+            if not duplicate:
+                twin = _recent_same_incoming(c, phone_digits, str(text_value)[:5000], False)
+                if twin:
+                    # The Meta-raw copy has no download link; the DoubleTick copy does. Keep one row, add the link.
+                    if media_url and not (twin['media_url'] or ''):
+                        c.execute("UPDATE chat_messages SET media_url=?,message_type=? WHERE id=?",
+                                  (media_url[:2000], message_type, twin['id']))
+                        c.commit()
+                    duplicate = {'id': twin['id']}
             if not duplicate:
                 c.execute(
                     "INSERT INTO chat_messages(user_id,phone,candidate_name,direction,"

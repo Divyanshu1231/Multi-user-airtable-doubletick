@@ -299,7 +299,7 @@ _backfill_states={}
 _backfill_lock=threading.Lock()
 
 def _new_backfill_state():
-    return {'running':False,'total':0,'done':0,'inserted':0,'skipped_existing':0,'not_found':0,'errors':0,'last_error':'','finished':False}
+    return {'sample':'','links_added':0,'running':False,'total':0,'done':0,'inserted':0,'skipped_existing':0,'not_found':0,'errors':0,'last_error':'','finished':False}
 
 def _run_chat_backfill(days, max_phones, user_id, st):
     """user_id=None imports for every recruiter (admin); otherwise only chats whose
@@ -356,7 +356,16 @@ def _run_chat_backfill(days, max_phones, user_id, st):
                         m=it.get('message') if isinstance(it.get('message'),dict) else {}
                         doc=m.get('document') if isinstance(m.get('document'),dict) else {}
                         mtype=str(m.get('messageType') or m.get('type') or 'TEXT').upper()
+                        if mtype!='TEXT' and not st.get('sample'):
+                            st['sample']=json.dumps(it,ensure_ascii=False,default=str)[:900]
                         media=str(m.get('url') or m.get('mediaUrl') or doc.get('url') or doc.get('link') or '')[:2000]
+                        if not media and mtype!='TEXT':
+                            for k,v in m.items():
+                                if k not in ('text','caption') and isinstance(v,str) and v.startswith(('http://','https://')): media=v[:2000]; break
+                                if isinstance(v,dict):
+                                    for k2,v2 in v.items():
+                                        if isinstance(v2,str) and v2.startswith(('http://','https://')): media=v2[:2000]; break
+                                    if media: break
                         fname=str(m.get('fileName') or m.get('filename') or doc.get('filename') or doc.get('fileName') or '').strip()
                         text=m.get('text') or m.get('caption') or ''
                         if isinstance(text,dict): text=text.get('body') or json.dumps(text,ensure_ascii=False)
@@ -373,10 +382,13 @@ def _run_chat_backfill(days, max_phones, user_id, st):
                                 c.execute("UPDATE chat_messages SET media_url=?,message_type=? WHERE id=?",(media,mtype,same['id'])); st['links_added']=st.get('links_added',0)+1
                             st['skipped_existing']+=1; continue
                         dup=None
-                        for ex in c.execute("SELECT id,media_url,created_at FROM chat_messages WHERE phone=? AND direction='IN' AND content=?",(d,text)).fetchall():
+                        for ex in c.execute("SELECT id,media_url,message_type,content,created_at FROM chat_messages WHERE phone=? AND direction='IN'",(d,)).fetchall():
                             try:
+                                same_text=(ex['content']==text)
+                                file_like=bool(media) and mtype!='TEXT' and not (ex['media_url'] or '') and str(ex['message_type'] or '').upper()!='TEXT'
+                                if not (same_text or file_like): continue
                                 exd=ex['created_at'] if not isinstance(ex['created_at'],str) else datetime.fromisoformat(ex['created_at'].replace('T',' ').split('.')[0])
-                                if abs((exd.replace(tzinfo=None)-when.replace(tzinfo=None)).total_seconds())<180: dup=ex; break
+                                if abs((exd.replace(tzinfo=None)-when.replace(tzinfo=None)).total_seconds())<(180 if same_text else 600): dup=ex; break
                             except Exception: pass
                         if dup:
                             if media and not (dup['media_url'] or ''):

@@ -132,6 +132,7 @@ async function refreshTemplateStatuses(){try{let r=await api('/templates/refresh
 async function deleteTemplate(id){if(confirm('Delete this template?')){await api('/templates/'+id,{method:'DELETE'});templatesPage()}}
 async function chatsPage(){
  if(chatRefreshTimer){clearInterval(chatRefreshTimer);chatRefreshTimer=null}
+ autoSyncChats();
  let a=await api('/chats');
  $('view').innerHTML=`<div class="heading"><div><h1>WhatsApp Chats</h1><div class="muted">Live candidate conversations. Replies refresh automatically.</div></div><div class="row"><button class="btn secondary" onclick="backfillChats()">⬇ Import old replies</button><button class="btn secondary" onclick="refreshChats()">↻ Refresh</button></div></div><div class="card"><div class="grid" style="grid-template-columns:280px 1fr;align-items:start"><div><div class="field"><label>Search candidate / mobile</label><input id="chatSearch" placeholder="Search…" oninput="filterChatList()"></div><div class="row" id="chatFilters" style="gap:8px;margin:-4px 0 10px"><button class="btn secondary" id="cfAll" onclick="setChatFilter('all')">All</button><button class="btn secondary" id="cfUnread" onclick="setChatFilter('unread')">Unread <span id="unreadCount"></span></button></div><div id="chatlist" style="max-height:70vh;overflow:auto">${chatListHtml(a)}</div></div><div id="chatdetail" class="muted">Select a candidate to open conversation.</div></div></div>`;
  filterChatList();
@@ -148,7 +149,10 @@ async function backfillChats(){
   poll();
  }catch(e){alert(e.message)}
 }
+let lastAutoSync=0;
+function autoSyncChats(){const n=Date.now();if(n-lastAutoSync<60000)return;lastAutoSync=n;api('/chats/auto-sync',{method:'POST'}).catch(()=>{})}
 async function refreshChats(){
+ autoSyncChats();
  api('/history/sync-status',{method:'POST'}).catch(()=>{});
  const a=await api('/chats'),list=$('chatlist');
  if(list){list.innerHTML=chatListHtml(a);filterChatList()}

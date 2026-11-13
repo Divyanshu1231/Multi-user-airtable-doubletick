@@ -67,6 +67,9 @@ def db():
         c.execute("CREATE TABLE IF NOT EXISTS chat_messages(id BIGSERIAL PRIMARY KEY, user_id BIGINT, phone TEXT NOT NULL, candidate_name TEXT DEFAULT '', direction TEXT NOT NULL, message_type TEXT DEFAULT 'TEXT', content TEXT DEFAULT '', media_url TEXT DEFAULT '', provider_message_id TEXT DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         chat_cols={r['name'] for r in c.execute("SELECT column_name AS name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='chat_messages'").fetchall()}
         if 'is_read' not in chat_cols: c.execute("ALTER TABLE chat_messages ADD COLUMN is_read INTEGER NOT NULL DEFAULT 0")
+        if 'admin_read' not in chat_cols:
+            c.execute("ALTER TABLE chat_messages ADD COLUMN admin_read INTEGER NOT NULL DEFAULT 0")
+            c.execute("UPDATE chat_messages SET admin_read=COALESCE(is_read,0)")
         c.execute("CREATE TABLE IF NOT EXISTS internal_notes(id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, phone TEXT NOT NULL, note TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         c.execute("CREATE TABLE IF NOT EXISTS logs(id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, candidate_name TEXT, phone TEXT, kind TEXT, template_name TEXT, status TEXT, detail TEXT, provider_message_id TEXT DEFAULT '', status_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         c.execute("CREATE TABLE IF NOT EXISTS doubletick_webhook_events(id BIGSERIAL PRIMARY KEY, event_type TEXT DEFAULT '', provider_message_id TEXT DEFAULT '', recipient_phone TEXT DEFAULT '', provider_status TEXT DEFAULT '', normalized_status TEXT DEFAULT '', detail TEXT DEFAULT '', payload_json TEXT DEFAULT '', matched_log_id BIGINT, processing_result TEXT DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
@@ -84,6 +87,9 @@ def db():
     c.execute("CREATE TABLE IF NOT EXISTS chat_messages(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, phone TEXT NOT NULL, candidate_name TEXT DEFAULT '', direction TEXT NOT NULL, message_type TEXT DEFAULT 'TEXT', content TEXT DEFAULT '', media_url TEXT DEFAULT '', provider_message_id TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
     chat_cols={r['name'] for r in c.execute('PRAGMA table_info(chat_messages)').fetchall()}
     if 'is_read' not in chat_cols: c.execute("ALTER TABLE chat_messages ADD COLUMN is_read INTEGER NOT NULL DEFAULT 0")
+    if 'admin_read' not in chat_cols:
+        c.execute("ALTER TABLE chat_messages ADD COLUMN admin_read INTEGER NOT NULL DEFAULT 0")
+        c.execute("UPDATE chat_messages SET admin_read=COALESCE(is_read,0)")
     c.execute("CREATE TABLE IF NOT EXISTS internal_notes(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, phone TEXT NOT NULL, note TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
     c.execute("CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, candidate_name TEXT, phone TEXT, kind TEXT, template_name TEXT, status TEXT, detail TEXT, provider_message_id TEXT DEFAULT '', status_updated_at TEXT DEFAULT CURRENT_TIMESTAMP, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
     c.execute("CREATE TABLE IF NOT EXISTS doubletick_webhook_events(id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT DEFAULT '', provider_message_id TEXT DEFAULT '', recipient_phone TEXT DEFAULT '', provider_status TEXT DEFAULT '', normalized_status TEXT DEFAULT '', detail TEXT DEFAULT '', payload_json TEXT DEFAULT '', matched_log_id INTEGER, processing_result TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
@@ -364,6 +370,15 @@ def _kv_set(c,k,v):
     c.execute("INSERT INTO app_kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",(k,str(v)))
     c.commit()
 
+_dt_gate_lock=threading.Lock()
+_dt_gate_next=[0.0]
+def _dt_gate():
+    """Shared limiter so concurrent syncs together stay below DoubleTick's 300 requests/minute."""
+    with _dt_gate_lock:
+        now=time.time(); wait=_dt_gate_next[0]-now
+        _dt_gate_next[0]=max(now,_dt_gate_next[0])+0.22
+    if wait>0: time.sleep(wait)
+
 def _norm_phone(raw):
     d=re.sub(r'\D','',str(raw or ''))
     if len(d)==10: d='91'+d
@@ -378,9 +393,10 @@ def _import_phone(c, key, waba, d, start, oldest, now, st, only_user=None):
     if only_user and owner_uid!=only_user: return
     hdr={'Authorization':key,'Accept':'application/json'}
     prm={'wabaNumber':waba,'customerNumber':d,'startDate':start}
+    _dt_gate()
     resp=requests.get('https://public.doubletick.io/chat-messages',headers=hdr,params=prm,timeout=30)
     if resp.status_code==429:
-        time.sleep(10)
+        time.sleep(10); _dt_gate()
         resp=requests.get('https://public.doubletick.io/chat-messages',headers=hdr,params=prm,timeout=30)
     if resp.status_code==404: st['not_found']=st.get('not_found',0)+1; return
     if resp.status_code not in (200,201):
@@ -434,8 +450,8 @@ def _import_phone(c, key, waba, d, start, oldest, now, st, only_user=None):
             st['skipped_existing']=st.get('skipped_existing',0)+1; continue
         is_read=0 if (now-when).total_seconds()<48*3600 else 1
         name=str((owner['candidate_name'] if owner else '') or d)[:200]
-        c.execute("INSERT INTO chat_messages(user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id,created_at,is_read) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                  (owner_uid,d,name,'IN',mtype,text,media,mid,when.strftime('%Y-%m-%d %H:%M:%S'),is_read))
+        c.execute("INSERT INTO chat_messages(user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id,created_at,is_read,admin_read) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                  (owner_uid,d,name,'IN',mtype,text,media,mid,when.strftime('%Y-%m-%d %H:%M:%S'),is_read,is_read))
         st['inserted']=st.get('inserted',0)+1
     c.commit()
 
@@ -478,7 +494,6 @@ def _run_chat_backfill(days, max_phones, user_id, st):
                 except Exception: pass
                 st['errors']=st.get('errors',0)+1; st['last_error']=str(exc)[:200]
             st['done']+=1
-            time.sleep(0.3)
     finally:
         c.close(); st.update(running=False,finished=True)
         _backfill_lock.release()
@@ -500,14 +515,24 @@ def chats_backfill_status(u=Depends(current_user)):
     return dict(_backfill_states.setdefault(key,_new_backfill_state()))
 
 # ---- Automatic sync: keeps chats up to date without pressing Import ----
-def run_auto_sync(limit=250, days=2, full=False):
-    """Pull recent replies for (1) chats that already have customer messages in the last 3 days and
-    (2) numbers we messaged in the last 3 days (rotating window). full=True imports the whole retention window."""
+_auto_user_locks={}
+_auto_throttle={}
+_auto_gate=threading.Semaphore(3)
+
+def run_auto_sync(limit=250, days=2, full=False, user_id=None):
+    """Pull recent replies from DoubleTick.
+    user_id=None: everybody's chats (background job / admin). user_id=N: only that recruiter's candidates,
+    so a recruiter's own dashboard is refreshed quickly instead of waiting in a long rotation.
+    Order: (1) chats that already have customer messages in the last 3 days, (2) numbers messaged in the last
+    3 days, those that were READ/DELIVERED first, in a rotating window."""
     from datetime import datetime, timedelta, timezone
-    if not _auto_lock.acquire(blocking=False): return {'skipped':'already running'}
+    lock=_auto_lock if user_id is None else _auto_user_locks.setdefault(user_id,threading.Lock())
+    if not lock.acquire(blocking=False): return {'skipped':'already running'}
     st={'inserted':0,'skipped_existing':0,'not_found':0,'errors':0,'links_added':0}
+    got_gate=False
     try:
-        if _backfill_lock.locked(): return {'skipped':'manual import running'}
+        if _backfill_lock.locked() and user_id is None: return {'skipped':'manual import running'}
+        _auto_gate.acquire(); got_gate=True
         key,waba=_dt_ready(st)
         if not key: return {'skipped':st.get('last_error','not configured')}
         now=datetime.now(timezone.utc)
@@ -518,29 +543,46 @@ def run_auto_sync(limit=250, days=2, full=False):
         try:
             phones=[]; seen=set()
             if not full:
-                for r in c.execute("SELECT DISTINCT phone FROM chat_messages WHERE direction='IN' AND created_at>=? LIMIT 500",(since,)).fetchall():
+                if user_id is None:
+                    act=c.execute("SELECT DISTINCT phone FROM chat_messages WHERE direction='IN' AND created_at>=? LIMIT 500",(since,)).fetchall()
+                else:
+                    act=c.execute("SELECT DISTINCT phone FROM chat_messages WHERE direction='IN' AND user_id=? AND created_at>=? LIMIT 500",(user_id,since)).fetchall()
+                for r in act:
                     d=_norm_phone(r['phone'])
                     if d and d not in seen: seen.add(d); phones.append(d)
-            recent=[]
-            for r in c.execute("SELECT phone,MAX(id) mid FROM logs WHERE COALESCE(phone,'')<>'' AND created_at>=? GROUP BY phone ORDER BY mid DESC LIMIT 6000",(since,)).fetchall():
+            rank={'READ':0,'DELIVERED':1}
+            if user_id is None:
+                lg=c.execute("SELECT phone,status,id FROM logs WHERE COALESCE(phone,'')<>'' AND created_at>=? ORDER BY id DESC LIMIT 8000",(since,)).fetchall()
+            else:
+                lg=c.execute("SELECT phone,status,id FROM logs WHERE COALESCE(phone,'')<>'' AND user_id=? AND created_at>=? ORDER BY id DESC LIMIT 8000",(user_id,since)).fetchall()
+            best={}
+            for r in lg:
                 d=_norm_phone(r['phone'])
-                if d and d not in seen: seen.add(d); recent.append(d)
+                if not d or d in seen: continue
+                k=(rank.get(str(r['status'] or '').upper(),2),-int(r['id']))
+                if d not in best or k<best[d]: best[d]=k
+            recent=[d for d,_ in sorted(best.items(),key=lambda kv:kv[1])]
+            scope=user_id if user_id is not None else 0
+            offs=_auto_state.setdefault('offsets',{})
             if full:
                 batch=phones+recent
             else:
                 room=max(0,limit-len(phones))
-                off=_auto_state['offset']%max(1,len(recent)) if recent else 0
-                rot=(recent[off:]+recent[:off])[:room]
-                _auto_state['offset']=(off+len(rot))%max(1,len(recent)) if recent else 0
-                batch=phones[:limit]+rot
+                # READ/DELIVERED numbers are re-checked every run; the rest rotate.
+                hot=[d for d in recent if best[d][0]<2][:room]
+                cold=[d for d in recent if best[d][0]>=2]
+                room2=max(0,room-len(hot))
+                off=offs.get(scope,0)%max(1,len(cold)) if cold else 0
+                rot=(cold[off:]+cold[:off])[:room2]
+                offs[scope]=(off+len(rot))%max(1,len(cold)) if cold else 0
+                batch=phones[:limit]+hot+rot
             for d in batch:
                 try:
-                    _import_phone(c,key,waba,d,start,oldest,now,st)
+                    _import_phone(c,key,waba,d,start,oldest,now,st,user_id)
                 except Exception as exc:
                     try: c.rollback()
                     except Exception: pass
                     st['errors']+=1; st['last_error']=str(exc)[:200]
-                time.sleep(0.25)
             st['checked']=len(batch)
         finally:
             c.close()
@@ -548,16 +590,20 @@ def run_auto_sync(limit=250, days=2, full=False):
         import logging
         logging.getLogger("uvicorn.error").exception("Automatic chat sync failed")
     finally:
-        _auto_lock.release()
+        if got_gate: _auto_gate.release()
+        lock.release()
     st.pop('sample',None); _auto_state['last_summary']=st
     return st
 
 @app.post('/api/chats/auto-sync')
 def chats_auto_sync(u=Depends(current_user)):
-    """Called by the Chats page while it is open (at most about once a minute)."""
-    if time.time()-_auto_state['last_start']<45: return {'ok':True,'throttled':True}
-    _auto_state['last_start']=time.time()
-    threading.Thread(target=run_auto_sync,kwargs={'limit':120},daemon=True).start()
+    """Called by the Chats page while it is open (about every 30 seconds). Each recruiter refreshes
+    their own candidates; admin refreshes everybody."""
+    uid=None if u['role']=='admin' else u['id']
+    k=uid if uid is not None else 0
+    if time.time()-_auto_throttle.get(k,0)<25: return {'ok':True,'throttled':True}
+    _auto_throttle[k]=time.time()
+    threading.Thread(target=run_auto_sync,kwargs={'limit':150,'user_id':uid},daemon=True).start()
     return {'ok':True,'started':True,'last':_auto_state.get('last_summary',{})}
 
 def _auto_import_loop():
@@ -1695,7 +1741,7 @@ def mark_chat_read(phone:str,u=Depends(current_user)):
     c=db()
     try:
         if not _chat_phone_allowed(c,digits,u): raise HTTPException(403,'This conversation is not assigned to your HR account.')
-        if u['role']=='admin': c.execute("UPDATE chat_messages SET is_read=1 WHERE phone=? AND direction='IN'",(digits,))
+        if u['role']=='admin': c.execute("UPDATE chat_messages SET admin_read=1 WHERE phone=? AND direction='IN'",(digits,))
         else: c.execute("UPDATE chat_messages SET is_read=1 WHERE phone=? AND user_id=? AND direction='IN'",(digits,u['id']))
         c.commit(); return {'ok':True,'marked_read':True}
     finally: c.close()
@@ -1886,7 +1932,7 @@ def analytics(days: int = 30, user_id: int = 0, u=Depends(current_user)):
 def chats(u=Depends(current_user)):
     c=db()
     if u['role']=='admin':
-        rows=c.execute("SELECT phone,MAX(candidate_name) candidate_name,MAX(created_at) last_at,COUNT(*) message_count,SUM(CASE WHEN direction='IN' AND COALESCE(is_read,0)=0 THEN 1 ELSE 0 END) unread_count FROM chat_messages GROUP BY phone ORDER BY last_at DESC LIMIT 500").fetchall()
+        rows=c.execute("SELECT phone,MAX(candidate_name) candidate_name,MAX(created_at) last_at,COUNT(*) message_count,SUM(CASE WHEN direction='IN' AND COALESCE(admin_read,0)=0 THEN 1 ELSE 0 END) unread_count FROM chat_messages GROUP BY phone ORDER BY last_at DESC LIMIT 500").fetchall()
         sent=c.execute("SELECT phone,MAX(candidate_name) candidate_name,MAX(created_at) last_at,COUNT(*) message_count FROM logs WHERE created_at>=? GROUP BY phone ORDER BY last_at DESC LIMIT 500",(_chat_cutoff(),)).fetchall()
     else:
         rows=c.execute("SELECT phone,MAX(candidate_name) candidate_name,MAX(created_at) last_at,COUNT(*) message_count,SUM(CASE WHEN direction='IN' AND COALESCE(is_read,0)=0 THEN 1 ELSE 0 END) unread_count FROM chat_messages WHERE user_id=? GROUP BY phone ORDER BY last_at DESC LIMIT 300",(u['id'],)).fetchall()

@@ -240,31 +240,25 @@ function chatMessageHtml(x){
  return `<div style="display:flex;justify-content:${incoming?'flex-start':'flex-end'};margin:9px 0"><div style="max-width:78%;padding:10px 13px;border-radius:12px;background:${incoming?'#fff':'#dbeafe'};border:1px solid #e5e7eb"><div class="small muted">${incoming?'Candidate':'You'} · ${esc(x.created_at||'')}</div><div style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(content)}</div>${chatMediaHtml(x)}${statusHtml}${reasonHtml}</div></div>`;
 }
 
+function chatSig(s){let h=0;for(let i=0;i<s.length;i++){h=(h*31+s.charCodeAt(i))|0}return s.length+':'+h}
 async function renderChat(phone,name){
- // Preserve the unsent draft while the 10-second inbox refresh updates the conversation.
- const samePhone=(renderedChatPhone===phone);
- const oldNote=$('internalNoteText');
- const noteDraft=(samePhone&&oldNote)?oldNote.value:'';
- const noteFocused=(samePhone&&oldNote)?document.activeElement===oldNote:false;
- const noteSelStart=(samePhone&&oldNote&&typeof oldNote.selectionStart==='number')?oldNote.selectionStart:noteDraft.length;
- const noteSelEnd=(samePhone&&oldNote&&typeof oldNote.selectionEnd==='number')?oldNote.selectionEnd:noteDraft.length;
- const oldField=$('chatReplyText');
- const draft=(samePhone&&oldField) ? oldField.value : '';
- const wasFocused=oldField ? document.activeElement===oldField : false;
- const selectionStart=oldField && typeof oldField.selectionStart==='number' ? oldField.selectionStart : draft.length;
- const selectionEnd=oldField && typeof oldField.selectionEnd==='number' ? oldField.selectionEnd : draft.length;
+ // Same chat already open (the 10-second auto refresh): only update the message list. The reply box,
+ // the internal-note box and the cursor are never rebuilt, so nothing the user is typing can be lost.
+ const hadPanel=(renderedChatPhone===phone&&!!$('chatmessages'));
  try{await api('/chats/'+encodeURIComponent(phone)+'/read',{method:'POST'})}catch(e){console.warn('Mark read:',e.message)}
  let a=await api('/chats/'+encodeURIComponent(phone)),box=$('chatdetail');if(!box)return;
+ if(phone!==activeChatPhone)return;
+ const mbox=$('chatmessages');
+ if(hadPanel&&mbox){
+  const nearBottom=mbox.scrollHeight-mbox.scrollTop-mbox.clientHeight<80;
+  const html=a.map(chatMessageHtml).join('')||'<p class="muted">No messages saved for this candidate yet. Incoming messages appear after DoubleTick sends the MESSAGE_RECEIVED webhook.</p>';
+  const sig=chatSig(html);if(mbox.dataset.sig!==sig){mbox.innerHTML=html;mbox.dataset.sig=sig;if(nearBottom)mbox.scrollTop=mbox.scrollHeight;hydrateChatMedia()}
+  loadInternalNotes(phone);
+  return;
+ }
  box.innerHTML=`<div class="row" style="justify-content:space-between"><div><h3 style="margin:0">${esc(name)}</h3><div class="muted small">${esc(phone)}</div></div><button class="btn secondary" onclick="renderChat('${esc(phone)}','${esc(name)}')">↻</button></div><div id="chatmessages" style="height:52vh;overflow:auto;background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:14px;margin-top:12px">${a.map(chatMessageHtml).join('')||'<p class="muted">No messages saved for this candidate yet. Incoming messages appear after DoubleTick sends the MESSAGE_RECEIVED webhook.</p>'}</div><div style="display:flex;gap:8px;margin-top:10px"><textarea id="chatReplyText" rows="2" maxlength="4000" placeholder="Type a WhatsApp reply…" style="flex:1;resize:vertical;border:1px solid #d6dce6;border-radius:9px;padding:11px;font:inherit" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChatReply()}"></textarea><button class="btn" id="chatSendBtn" onclick="sendChatReply()">Send</button></div><div class="small muted" style="margin-top:7px">Free-form text replies work only within WhatsApp's 24-hour customer service window after the candidate's last message. Outside that window, send an approved template.</div><div class="internal-notes"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Internal Notes (Recruiter / Team Member)</h3><span class="small muted">Not sent to WhatsApp</span></div><textarea id="internalNoteText" rows="2" maxlength="3000" placeholder="Example: Candidate se baat ho gayi; salary discuss kar li." style="width:100%;margin-top:9px;box-sizing:border-box;border:1px solid #d6dce6;border-radius:8px;padding:10px;font:inherit"></textarea><div class="row" style="justify-content:flex-end;margin-top:7px"><button class="btn secondary" onclick="saveInternalNote()">Save internal note</button></div><div id="internalNotesList" class="small muted" style="margin-top:10px">Loading notes…</div></div>`;
  loadInternalNotes(phone);
  renderedChatPhone=phone;
- const newNote=$('internalNoteText');
- if(newNote&&noteDraft){newNote.value=noteDraft;if(noteFocused){newNote.focus();try{newNote.setSelectionRange(noteSelStart,noteSelEnd)}catch(_){}}}
- const newField=$('chatReplyText');
- if(newField){
-   newField.value=draft;
-   if(wasFocused){newField.focus();try{newField.setSelectionRange(selectionStart,selectionEnd)}catch(_){}}
- }
  let m=$('chatmessages');m.scrollTop=m.scrollHeight;hydrateChatMedia();
 }
 async function loadInternalNotes(phone){

@@ -277,16 +277,67 @@ def _chat_cutoff():
     from datetime import datetime, timedelta, timezone
     return (datetime.now(timezone.utc)-timedelta(days=CHAT_RETENTION_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
 
+def _ensure_contacts_table(c):
+    c.execute("CREATE TABLE IF NOT EXISTS chat_contacts(phone TEXT PRIMARY KEY, user_id BIGINT, candidate_name TEXT DEFAULT '', last_sent_at TEXT DEFAULT '')")
+
+def _logs_owner(c,last10):
+    if DATABASE_URL:
+        return c.execute("SELECT user_id,candidate_name FROM logs WHERE RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? ORDER BY id DESC LIMIT 1",(last10,)).fetchone()
+    return c.execute("SELECT user_id,candidate_name FROM logs WHERE substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? ORDER BY id DESC LIMIT 1",(last10,)).fetchone()
+
+def _lookup_owner(c,last10):
+    """Who last messaged this number? Looks at recent send logs first, then at the small
+    chat_contacts table that remembers owners after old logs were deleted."""
+    r=_logs_owner(c,last10)
+    if r: return r
+    try:
+        return c.execute("SELECT user_id,candidate_name FROM chat_contacts WHERE phone=?",(last10,)).fetchone()
+    except Exception:
+        try: c.rollback()
+        except Exception: pass
+        return None
+
+def _user_owns(c,uid,last10):
+    if DATABASE_URL:
+        row=c.execute("SELECT 1 FROM logs WHERE user_id=? AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? LIMIT 1",(uid,last10)).fetchone()
+    else:
+        row=c.execute("SELECT 1 FROM logs WHERE user_id=? AND substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? LIMIT 1",(uid,last10)).fetchone()
+    if row: return True
+    try:
+        if c.execute("SELECT 1 FROM chat_contacts WHERE phone=? AND user_id=? LIMIT 1",(last10,uid)).fetchone(): return True
+    except Exception:
+        try: c.rollback()
+        except Exception: pass
+    return bool(c.execute("SELECT 1 FROM chat_messages WHERE user_id=? AND phone LIKE ? LIMIT 1",(uid,'%'+last10)).fetchone())
+
 def cleanup_old_chats():
-    """Delete saved WhatsApp chat messages older than CHAT_RETENTION_DAYS.
-    Message History (logs) and internal notes are not touched."""
+    """Keep the database small: delete chats, send history and webhook audit rows older than
+    CHAT_RETENTION_DAYS (default 7). Before old send logs are deleted, who-owns-which-number is saved in the
+    tiny chat_contacts table, so a reply from an old contact is still shown to the right recruiter."""
+    from datetime import datetime, timedelta, timezone
     try:
         c=db()
         try:
-            c.execute("DELETE FROM chat_messages WHERE created_at < ?",(_chat_cutoff(),))
+            cutoff=_chat_cutoff()
+            _ensure_contacts_table(c); c.commit()
+            while True:
+                rows=c.execute("SELECT id,user_id,candidate_name,phone,created_at FROM logs WHERE created_at < ? ORDER BY id ASC LIMIT 2000",(cutoff,)).fetchall()
+                if not rows: break
+                latest={}
+                for r in rows:
+                    d=re.sub(r'\D','',str(r['phone'] or ''))[-10:]
+                    if len(d)<10: continue
+                    latest[d]=(r['user_id'],str(r['candidate_name'] or '')[:200],str(r['created_at']))
+                for d,(uid,name,ts) in latest.items():
+                    c.execute("INSERT INTO chat_contacts(phone,user_id,candidate_name,last_sent_at) VALUES(?,?,?,?) ON CONFLICT(phone) DO UPDATE SET user_id=excluded.user_id,candidate_name=excluded.candidate_name,last_sent_at=excluded.last_sent_at WHERE chat_contacts.last_sent_at < excluded.last_sent_at",(d,uid,name,ts))
+                c.execute("DELETE FROM logs WHERE id<=? AND created_at < ?",(rows[-1]['id'],cutoff))
+                c.commit()
+                if len(rows)<2000: break
+            c.execute("DELETE FROM chat_messages WHERE created_at < ?",(cutoff,))
             # Remove WhatsApp delivery-error texts that older code saved as if the candidate had written them.
             c.execute("DELETE FROM chat_messages WHERE direction='IN' AND COALESCE(provider_message_id,'')='' AND (content LIKE ? OR content LIKE ? OR content LIKE ? OR content LIKE ?)",
                       ('This message was not delivered%','Message undeliverable%','Re-engagement message%','Message Undeliverable%'))
+            c.execute("DELETE FROM doubletick_webhook_events WHERE created_at < ?",((datetime.now(timezone.utc)-timedelta(days=3)).strftime('%Y-%m-%d %H:%M:%S'),))
             c.commit()
         finally:
             c.close()
@@ -322,9 +373,7 @@ def _import_phone(c, key, waba, d, start, oldest, now, st, only_user=None):
     """Fetch one candidate's chat from DoubleTick and save customer messages not yet in the DB.
     Also attaches missing download links to rows saved earlier by the webhook."""
     from datetime import datetime, timezone
-    owner_sql=("SELECT user_id,candidate_name FROM logs WHERE RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? ORDER BY id DESC LIMIT 1" if DATABASE_URL else
-               "SELECT user_id,candidate_name FROM logs WHERE substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? ORDER BY id DESC LIMIT 1")
-    owner=c.execute(owner_sql,(d[-10:],)).fetchone()
+    owner=_lookup_owner(c,d[-10:])
     owner_uid=owner['user_id'] if owner else None
     if only_user and owner_uid!=only_user: return
     hdr={'Authorization':key,'Accept':'application/json'}
@@ -1058,10 +1107,7 @@ def _handle_meta_raw_payload(payload, logger):
                         skipped+=1; continue
                     if _recent_same_incoming(c,phone,text[:5000],True):
                         skipped+=1; continue
-                    if DATABASE_URL:
-                        owner=c.execute("SELECT user_id,candidate_name FROM logs WHERE RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? ORDER BY id DESC LIMIT 1",(phone[-10:],)).fetchone()
-                    else:
-                        owner=c.execute("SELECT user_id,candidate_name FROM logs WHERE substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? ORDER BY id DESC LIMIT 1",(phone[-10:],)).fetchone()
+                    owner=_lookup_owner(c,phone[-10:])
                     name=str((owner['candidate_name'] if owner and owner['candidate_name'] else '') or names.get(phone) or phone)[:200]
                     c.execute("INSERT INTO chat_messages(user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id) VALUES(?,?,?,?,?,?,?,?)",
                               (owner['user_id'] if owner else None,phone,name,'IN',mtype,text[:5000],'',mid))
@@ -1315,18 +1361,7 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
 
         c = db()
         try:
-            if DATABASE_URL:
-                owner = c.execute(
-                    "SELECT user_id,candidate_name FROM logs "
-                    "WHERE RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? "
-                    "ORDER BY id DESC LIMIT 1", (phone_digits[-10:],)
-                ).fetchone()
-            else:
-                owner = c.execute(
-                    "SELECT user_id,candidate_name FROM logs "
-                    "WHERE substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? "
-                    "ORDER BY id DESC LIMIT 1", (phone_digits[-10:],)
-                ).fetchone()
+            owner = _lookup_owner(c, phone_digits[-10:])
             user_id = owner['user_id'] if owner else None
             if owner and owner['candidate_name']:
                 candidate_name = str(owner['candidate_name'])[:200]
@@ -1624,10 +1659,7 @@ def send_chat_reply(phone:str, x:ChatReplyIn, u=Depends(current_user)):
     if not recipient: raise HTTPException(400,'Candidate phone number must be a valid international number.')
     c=db()
     if u['role']!='admin':
-        if DATABASE_URL:
-            allowed=c.execute("SELECT 1 FROM logs WHERE user_id=? AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? LIMIT 1",(u['id'],digits[-10:])).fetchone()
-        else:
-            allowed=c.execute("SELECT 1 FROM logs WHERE user_id=? AND substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? LIMIT 1",(u['id'],digits[-10:])).fetchone()
+        allowed=_user_owns(c,u['id'],digits[-10:])
         if not allowed:
             c.close(); raise HTTPException(403,'This conversation is not assigned to your HR account.')
     msg_id=str(uuid.uuid4())
@@ -1644,10 +1676,7 @@ def send_chat_reply(phone:str, x:ChatReplyIn, u=Depends(current_user)):
         raise HTTPException(resp.status_code if 400<=resp.status_code<500 else 502,
             f'DoubleTick rejected reply. Free-form replies require an active 24-hour customer service window. Provider response: {detail}')
     provider_id=_find_provider_message_id(body) or msg_id
-    if DATABASE_URL:
-        name_row=c.execute("SELECT candidate_name FROM logs WHERE RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? ORDER BY id DESC LIMIT 1",(digits[-10:],)).fetchone()
-    else:
-        name_row=c.execute("SELECT candidate_name FROM logs WHERE substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? ORDER BY id DESC LIMIT 1",(digits[-10:],)).fetchone()
+    name_row=_lookup_owner(c,digits[-10:])
     candidate_name=name_row['candidate_name'] if name_row else ''
     c.execute("INSERT INTO chat_messages(user_id,phone,candidate_name,direction,message_type,content,media_url,provider_message_id) VALUES(?,?,?,?,?,?,?,?)",
         (u['id'],digits,candidate_name,'OUT','TEXT',message,'',provider_id))
@@ -1657,11 +1686,7 @@ def send_chat_reply(phone:str, x:ChatReplyIn, u=Depends(current_user)):
 
 def _chat_phone_allowed(c,digits,u):
     if u['role']=='admin': return True
-    if DATABASE_URL:
-        row=c.execute("SELECT 1 FROM logs WHERE user_id=? AND RIGHT(REGEXP_REPLACE(COALESCE(phone,''),'[^0-9]','','g'),10)=? LIMIT 1",(u['id'],digits[-10:])).fetchone()
-    else:
-        row=c.execute("SELECT 1 FROM logs WHERE user_id=? AND substr(replace(replace(replace(phone,'+',''),' ',''),'-',''),-10)=? LIMIT 1",(u['id'],digits[-10:])).fetchone()
-    return bool(row)
+    return _user_owns(c,u['id'],digits[-10:])
 
 @app.post('/api/chats/{phone}/read')
 def mark_chat_read(phone:str,u=Depends(current_user)):

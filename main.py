@@ -425,7 +425,7 @@ def _import_phone(c, key, waba, d, start, oldest, now, st, only_user=None):
         if isinstance(text,dict): text=text.get('body') or json.dumps(text,ensure_ascii=False)
         text=str(text or '')
         if fname: text=(f'📄 {fname}'+('\n'+text if text else ''))
-        if not text: text=f'[{mtype}]' if media else f'[{mtype} message]'
+        if not text: text=_describe_nontext(mtype,m) or (f'[{mtype}]' if media else f'[{mtype} message]')
         text=text[:5000]
         try: when=datetime.fromtimestamp(int(it.get('messageTime'))/1000,tz=timezone.utc)
         except Exception: when=now
@@ -1111,8 +1111,43 @@ def _recent_same_incoming(c, phone, content, meta_source):
         sql="SELECT id,media_url FROM chat_messages WHERE phone=? AND direction='IN' AND content=? AND created_at>=? AND provider_message_id LIKE ? LIMIT 1"
     return c.execute(sql,(phone,content,since,'wamid.%')).fetchone()
 
+
+UNSUPPORTED_TEXT = ("⚠ Candidate ne aisa message bheja jo WhatsApp Business API support nahi karta "
+                    "(jaise view-once photo/video, poll ya koi naya feature), isliye uska content yahan nahi aa sakta. "
+                    "Candidate se normal text, photo ya document dobara bhejne ko kaho.")
+
+def _describe_nontext(mtype, obj):
+    """Readable text for message types that have no plain text (location, contact card, reaction, ...)."""
+    t=str(mtype or '').upper()
+    try:
+        if t=='UNSUPPORTED': return UNSUPPORTED_TEXT
+        if t=='LOCATION' and isinstance(obj,dict):
+            lat=obj.get('latitude'); lng=obj.get('longitude')
+            label=' '.join(str(x) for x in (obj.get('name'),obj.get('address')) if x)
+            if lat is not None and lng is not None:
+                return f"📍 Location{(': '+label) if label else ''}\nhttps://maps.google.com/?q={lat},{lng}"
+        if t in ('CONTACTS','CONTACT'):
+            items=obj if isinstance(obj,list) else (obj.get('contacts') if isinstance(obj,dict) else None) or []
+            lines=[]
+            for ct in items:
+                if not isinstance(ct,dict): continue
+                nm=ct.get('name'); nm=(nm.get('formatted_name') or nm.get('first_name') or '') if isinstance(nm,dict) else (nm or '')
+                ph=', '.join(str(p.get('phone') or p.get('wa_id') or '') for p in (ct.get('phones') or []) if isinstance(p,dict))
+                lines.append(f"👤 {nm} {ph}".strip())
+            if lines: return 'Contact shared:\n'+'\n'.join(lines)
+        if t=='REACTION' and isinstance(obj,dict) and obj.get('emoji'): return f"Reacted {obj.get('emoji')}"
+        if t in ('FLOW','FLOW_RESPONSE') and isinstance(obj,dict):
+            fr=obj.get('flowResponse') or obj
+            return 'Form response: '+json.dumps(fr,ensure_ascii=False)[:800]
+    except Exception:
+        pass
+    return ''
+
 def _meta_message_text(m):
     t=str(m.get('type') or 'text').lower()
+    if t in ('unsupported','location','contacts'):
+        d=_describe_nontext(t,m.get(t) if t=='contacts' else (m.get(t) if isinstance(m.get(t),dict) else {}))
+        if d: return d
     obj=m.get(t) if isinstance(m.get(t),dict) else {}
     if t=='text': return str(obj.get('body') or '')
     if t=='reaction': return ''
@@ -1400,6 +1435,8 @@ async def doubletick_webhook(request: Request, x_webhook_secret: Optional[str] =
                              phone_digits)[:200]
         if file_name:
             text_value = f'📄 {file_name}' + (f'\n{text_value}' if text_value else '')
+        if not text_value and not file_name:
+            text_value = _describe_nontext(message_type, msg) or ''
         if not text_value:
             text_value = f'[{message_type}]' if media_url else f'[{message_type} message]'
         message_id = str(msg.get('dtMessageId') or msg.get('messageId') or msg.get('id') or

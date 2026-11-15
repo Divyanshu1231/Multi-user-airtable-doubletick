@@ -1112,9 +1112,10 @@ def _recent_same_incoming(c, phone, content, meta_source):
     return c.execute(sql,(phone,content,since,'wamid.%')).fetchone()
 
 
-UNSUPPORTED_TEXT = ("⚠ Candidate ne aisa message bheja jo WhatsApp Business API support nahi karta "
-                    "(jaise view-once photo/video, poll ya koi naya feature), isliye uska content yahan nahi aa sakta. "
-                    "Candidate se normal text, photo ya document dobara bhejne ko kaho.")
+UNSUPPORTED_TEXT = ("⚠ "
+                    "This candidate sent a message type that the WhatsApp Business API does not deliver "
+                    "(for example a view-once photo/video, a poll or a newer WhatsApp feature), "
+                    "so its content cannot be shown here. Ask the candidate to send a normal text, photo or document again.")
 
 def _describe_nontext(mtype, obj):
     """Readable text for message types that have no plain text (location, contact card, reaction, ...)."""

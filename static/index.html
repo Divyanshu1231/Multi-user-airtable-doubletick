@@ -231,6 +231,7 @@ function chatMessageHtml(x){
  if(!incoming && ['CSV','APPROVED','WEBHOOK_RECONCILED','APPROVED'].includes(String(x.message_type||'').toUpperCase())){
    content='Template: '+(content||'WhatsApp template');
  }
+ if(/^\[UNSUPPORTED( message)?\]$/i.test(content.trim()))content='⚠ Candidate ne aisa message bheja jo WhatsApp Business API support nahi karta (jaise view-once photo/video, poll ya koi naya feature), isliye uska content yahan nahi aa sakta. Candidate se normal text, photo ya document dobara bhejne ko kaho.';
  if(!content)content='['+(x.message_type||'MESSAGE')+']';
  const reason=chatProviderReason(x.detail);
  const showReason=!!reason && (st==='FAILED'||st==='FREQUENCY_CAPPING');

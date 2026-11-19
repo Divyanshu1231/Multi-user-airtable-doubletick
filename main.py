@@ -277,7 +277,8 @@ def history_sync_status(u=Depends(current_user)):
 
 
 # ---- Chat retention: only the last N days of chats are kept (default 7) ----
-CHAT_RETENTION_DAYS=max(1,int(os.getenv('CHAT_RETENTION_DAYS','7') or 7))
+CHAT_RETENTION_DAYS=max(1,int(os.getenv('CHAT_RETENTION_DAYS','15') or 15))
+RESEND_BLOCK_DAYS=max(1,min(CHAT_RETENTION_DAYS,int(os.getenv('RESEND_BLOCK_DAYS','15') or 15)))
 
 def _chat_cutoff():
     from datetime import datetime, timedelta, timezone
@@ -318,7 +319,7 @@ def _user_owns(c,uid,last10):
 
 def cleanup_old_chats():
     """Keep the database small: delete chats, send history and webhook audit rows older than
-    CHAT_RETENTION_DAYS (default 7). Before old send logs are deleted, who-owns-which-number is saved in the
+    CHAT_RETENTION_DAYS (default 15). Before old send logs are deleted, who-owns-which-number is saved in the
     tiny chat_contacts table, so a reply from an old contact is still shown to the right recruiter."""
     from datetime import datetime, timedelta, timezone
     try:
@@ -499,7 +500,7 @@ def _run_chat_backfill(days, max_phones, user_id, st):
         _backfill_lock.release()
 
 @app.post('/api/chats/backfill')
-def chats_backfill(days:int=7,max_phones:int=3000,u=Depends(current_user)):
+def chats_backfill(days:int=15,max_phones:int=3000,u=Depends(current_user)):
     days=max(1,min(days,CHAT_RETENTION_DAYS)); max_phones=max(1,min(max_phones,10000))
     key=0 if u['role']=='admin' else u['id']
     st=_backfill_states.setdefault(key,_new_backfill_state())
@@ -537,8 +538,8 @@ def run_auto_sync(limit=250, days=2, full=False, user_id=None):
         if not key: return {'skipped':st.get('last_error','not configured')}
         now=datetime.now(timezone.utc)
         oldest=now-timedelta(days=CHAT_RETENTION_DAYS)
-        start=(now+timedelta(hours=5,minutes=30)-timedelta(days=(CHAT_RETENTION_DAYS if full else days))).strftime('%d-%m-%Y')
-        since=(now-timedelta(days=(CHAT_RETENTION_DAYS if full else 3))).strftime('%Y-%m-%d %H:%M:%S')
+        start=(now+timedelta(hours=5,minutes=30)-timedelta(days=CHAT_RETENTION_DAYS)).strftime('%d-%m-%Y')
+        since=(now-timedelta(days=CHAT_RETENTION_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
         c=db()
         try:
             phones=[]; seen=set()
@@ -816,6 +817,21 @@ def preview_candidate_csv(x:CsvPreviewIn,u=Depends(current_user)):
     item['candidates']=candidates
     return {'total':len(result),'sendable':sum(1 for x in result if x['sendable']),'candidates':result}
 
+def _recently_messaged(c,phones,days=None):
+    """Return {last10digits: (created_at,user_id)} for numbers that already got a message in the last `days` days
+    (any recruiter). FAILED / FREQUENCY_CAPPING attempts do not count because nothing reached the candidate."""
+    from datetime import datetime, timedelta, timezone
+    days=days or RESEND_BLOCK_DAYS
+    cut=(datetime.now(timezone.utc)-timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+    want={re.sub(r'\D','',str(p or ''))[-10:] for p in phones}; want.discard('')
+    out={}
+    if not want: return out
+    rows=c.execute("SELECT phone,created_at,user_id FROM logs WHERE created_at>=? AND COALESCE(phone,'')<>'' AND UPPER(COALESCE(status,'')) NOT IN ('FAILED','FREQUENCY_CAPPING') ORDER BY id DESC",(cut,)).fetchall()
+    for r in rows:
+        k=re.sub(r'\D','',str(r['phone'] or ''))[-10:]
+        if k in want and k not in out: out[k]=(str(r['created_at'] or '')[:10],r['user_id'])
+    return out
+
 @app.post('/api/csv/send')
 def send_candidate_csv(x:CsvSendIn,u=Depends(current_user)):
     item=_csv_uploads.get(x.upload_id)
@@ -848,6 +864,17 @@ def send_candidate_csv(x:CsvSendIn,u=Depends(current_user)):
             remaining=max(0,limit-used)
             if len(chosen)>remaining: raise HTTPException(429,f'Daily WhatsApp limit reached. You can attempt {remaining} more message(s) today.')
         results=[]
+        recent=_recently_messaged(c,[cd['phone'] for _,cd in chosen])
+        todo=[]
+        for i,cand in chosen:
+            hit=recent.get(re.sub(r'\D','',cand['phone'])[-10:])
+            if hit:
+                results.append({'name':cand['name'],'status':'SKIPPED_RECENT','detail':f'Already messaged on {hit[0]} (within {RESEND_BLOCK_DAYS} days)'})
+            else: todo.append((i,cand))
+        chosen=todo
+        if u['role']!='admin':
+            used=c.execute("SELECT COUNT(*) n FROM logs WHERE user_id=? AND date(created_at,'+5 hours','+30 minutes')=date('now','+5 hours','+30 minutes')",(u['id'],)).fetchone()['n']
+            if len(chosen)>max(0,limit-used): raise HTTPException(429,f'Daily WhatsApp limit reached. You can attempt {max(0,limit-used)} more message(s) today.')
         for i,cand in chosen:
             status='FAILED'; detail=''; provider_id=''
             # Construct the same candidate shape expected by matcher.py.
@@ -861,7 +888,7 @@ def send_candidate_csv(x:CsvSendIn,u=Depends(current_user)):
             except Exception as exc: detail=str(exc)[:1500]
             c.execute("INSERT INTO logs(user_id,candidate_name,phone,kind,template_name,status,detail,provider_message_id,status_updated_at) VALUES(?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",(u['id'],cand['name'],cand['phone'],'csv','CSV: '+x.template_name.strip(),status,detail,provider_id))
             c.commit(); results.append({'name':cand['name'],'status':status,'detail':detail})
-        return {'ok':True,'summary':{'total':len(results),'sent':sum(z['status'] in ('SENT','DELIVERED','READ','ENQUEUED') for z in results),'failed':sum(z['status']=='FAILED' for z in results)},'results':results}
+        return {'ok':True,'summary':{'total':len(results),'sent':sum(z['status'] in ('SENT','DELIVERED','READ','ENQUEUED') for z in results),'failed':sum(z['status']=='FAILED' for z in results),'skipped':sum(z['status']=='SKIPPED_RECENT' for z in results)},'results':results}
     finally: c.close()
 
 @app.get('/api/templates')
@@ -1664,7 +1691,18 @@ def send(x:SendIn,u=Depends(current_user)):
         if rr['id'] in selected: found.append(r)
     if len(found)!=len(selected): raise HTTPException(400,'Some selected candidates are no longer in the configured Airtable views. Refresh the list.')
     c=db()
+    skipped=[]
     try:
+        recent=_recently_messaged(c,[str(candidate_fields(r).get('phone') or '') for r in found])
+        keep=[]
+        for r in found:
+            f0=candidate_fields(r); hit=recent.get(re.sub(r'\D','',str(f0.get('phone') or ''))[-10:])
+            if hit: skipped.append({'name':str(f0.get('name') or ''),'status':'SKIPPED_RECENT','detail':f'Already messaged on {hit[0]} (within {RESEND_BLOCK_DAYS} days)','message_id':''})
+            else: keep.append(r)
+        found=keep
+        if not found:
+            c.close()
+            return {'ok':True,'summary':{'total':len(skipped),'sent':0,'failed':0,'frequency_capping':0,'enqueued':0,'skipped':len(skipped)},'results':skipped}
         limit=int(get_setting('max_messages_per_user_per_day','50'))
         if u['role']!='admin':
             # Count every attempt (including failed sends) to prevent retries bypassing the cap.
@@ -1721,7 +1759,8 @@ def send(x:SendIn,u=Depends(current_user)):
         c.commit()
         results.append({'name':str(f.get('name') or ''),'status':current_status if current_status in final_states else status,'detail':detail,'message_id':provider_id})
     c.close()
-    return {'ok':True,'summary':{'total':len(results),'sent':sum(z['status'] in ('SENT','DELIVERED','READ','ENQUEUED') for z in results),'failed':sum(z['status']=='FAILED' for z in results),'frequency_capping':sum(z['status']=='FREQUENCY_CAPPING' for z in results),'enqueued':sum(z['status']=='ENQUEUED' for z in results)},'results':results}
+    results=skipped+results
+    return {'ok':True,'summary':{'total':len(results),'skipped':len(skipped),'sent':sum(z['status'] in ('SENT','DELIVERED','READ','ENQUEUED') for z in results),'failed':sum(z['status']=='FAILED' for z in results),'frequency_capping':sum(z['status']=='FREQUENCY_CAPPING' for z in results),'enqueued':sum(z['status']=='ENQUEUED' for z in results)},'results':results}
 
 
 def _reply_e164(value):
